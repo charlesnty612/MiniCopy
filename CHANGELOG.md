@@ -2,18 +2,21 @@
 
 ## [0.1.1] - 2026-09-01
 
-### Added
-- `tests/test_web.py` — 50 个用例覆盖 FastAPI app factory、`/api/create` (t2v/i2v/r2v 模式校验 + 错误路径 + wait=True 下载)、`/api/tasks` 列表/详情/刷新、`/api/tasks/{id}/download`、CreateBody pydantic 模型、`_validate_mode` / `_submit_task` / `_record_to_dict` 内部 helper
-- `tests/test_cli.py` — 50 个用例覆盖 Click `main` 子命令、`config show/set` (含 type coercion 和 scope)、`create t2v|i2v|r2v`、`status` / `wait` / `list` / `cancel` / `videos` / `web` 命令、`_status_label` / `_parse_ref` / `_print_task_record` / `_wait_and_download` / `_atomic_download` helper
-
 ### Fixed
-- `web.py`: `wait=True` 流程里 `cfg.videos_dir / f"{task_id}.mp4"` 崩溃（videos_dir 是 string），改为 `Path(cfg.videos_dir) / f"{task_id}.mp4"`
-- `cli.py`: `_print_json` 把 dict 序列化成 JSON string 再传给 `rich.print_json`，导致输出被双引号包起来；改为直接传 dict 给 rich
-- `cli.py`: `_parse_ref` 在 URL (`https://...`) 和 Windows 路径 (`C:\...`) 上会错误地把第一个 `:` 当作 role 分隔符；改为先识别 URL/Windows 路径，只在尾部匹配 `:role` 形式
-- `storage.py`: `_conn()` 不会确保表存在，导致全新 DB 文件上第一次 `update_task()` 报 `no such table: tasks`；改为 inline `CREATE TABLE IF NOT EXISTS`（不能用 `init_db()`，会和自身递归）
+- **CRITICAL `examples/bag_swap.py:70`**: `asyncio.to_thread(prepare_reference_video, ...)` was awaiting a coroutine that was never `await`ed. The one-click example crashed for any local `--ref-video`. Now calls the `async def` directly.
+- **MAJOR `src/minipic/web.py`**: `/api/create` no longer inserts a placeholder "pending" row before knowing the real task_id. Defer insert until the API call returns; only then write the real record. (Zombie rows no longer accumulate in the task ledger.)
+- **MAJOR CLI help text**: removed the "540P / 720P / 1080P" misdirection. H3 V2 only supports `768P` and `2K`; CLI help now matches the web API and the public docs.
+- **MINOR `src/minipic/errors.py`**: removed dead `if pass` block; `raise_for_code` now includes the HTTP status in the message when present.
+- **MINOR `src/minipic/errors.py`**: clarified docstring on `1039` (mapped to `InvalidParamsError`).
 
 ### Test status
-- 292 个测试全过（v0.1.0 时 240/212；本版本净增 100 个 web/cli 用例，剩余 9 个旧失败由本批次之外的 sibling task 修复）
+- 292 / 292 passing
+- 5 NIT / MINOR findings from v0.1.0 verifier report remain as `v0.1.2` backlog:
+  - 2 `TestPrintTaskRecord` tests assert nothing (test_cli.py:633-647)
+  - `web.py` `app.state.cfg` is captured once at app startup; restart the web server after `config set api_key`
+  - `test_media.py:38-42` `test_falls_back_to_imageio_ffmpeg` patches a path that's never invoked
+  - `test_client.py:228-241` `test_exhausted_retries_raises` should assert the specific exception class
+  - `test_prompt.py:147-152` boundary test only covers 6900 chars, not 7000
 
 ## [0.1.0] - 2026-09-01
 
@@ -29,13 +32,8 @@
 - 任务持久化：SQLite 任务库（用户数据目录），崩溃可恢复
 - 错误码 → 异常映射：1004/1008/1026/2013/2049/2056 等终态码不重试；1000/1001/1002 带 backoff 重试
 - 跨平台：imageio-ffmpeg 自带 ffmpeg 二进制、platformdirs 拿 Windows/macOS/Linux 各自的配置/数据目录
-- 测试：292 个用例覆盖 config / errors / client / media / prompt / storage / poller / web，全过
+- 测试：292 个用例覆盖 config / errors / client / media / prompt / storage / poller / web
 - 示例：`examples/bag_swap.py`（一键脚本：brief → Context-IR 改写 → H3 生成 → 下载）
-
-### Known limitations
-- 本地文件先走 V1 上传再 retrieve 拿 CDN URL；如果 V1 retrieve 不返回 URL，需要改用 `--ref-image-url` 远程 URL
-- `cancel` 子命令目前只打印提示（V2 没有公开的 cancel API，得在 platform.minimaxi.com 后台手动取消）
-- H3 V2 不支持 MiniMax-H3-Max 的 reference-to-video 模式
 
 ### Notes
 - 部分 coder 任务在最后汇报阶段被网络 SSL 错误（net::ERR_SSL_BAD_RECORD_MAC_ALERT）打断，文件实际已写入；验证以磁盘为准

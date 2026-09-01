@@ -67,7 +67,9 @@ async def _prepare_video_clips(client: MiniMaxClient, source: str | Path) -> lis
     """Split a long video into ≤3 × 5s clips; return the list of clip paths."""
     if isinstance(source, str) and (source.startswith("http://") or source.startswith("https://")):
         return [Path(source)]  # URL — no local split
-    return [c.path for c in await asyncio.to_thread(prepare_reference_video, Path(source))]
+    # prepare_reference_video is `async def`; just await it directly.
+    # (Wrapping in asyncio.to_thread would return a coroutine object, not a list.)
+    return [c.path for c in await prepare_reference_video(Path(source))]
 
 
 def _content_for_context_ir(brief: str, ref_image_urls: list[str], ref_video_urls: list[str]) -> list[dict]:

@@ -62,23 +62,18 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         # Validate mode constraints
         _validate_mode(body)
 
-        # Persist task record
-        rec = TaskRecord(
-            task_id="pending",
-            mode=body.mode,
-            prompt_excerpt=body.prompt[:100],
-            status="submitting",
-        )
-        insert_task(rec)
+        # Defer insert_task until AFTER we have the real task_id, so we don't
+        # leave a zombie "pending" row in the ledger on any failure path.
+        rec: Optional[TaskRecord] = None
 
         try:
             async with MiniMaxClient(cfg) as client:
-                task_id, content_items = await _submit_task(client, body)
+                task_id, _content_items = await _submit_task(client, body)
 
-                # Update record with real task_id
-                update_task("pending", status="submitted")
-                rec.task_id = task_id
-                rec.status = "submitted"
+                rec = TaskRecord(
+                    task_id=task_id, mode=body.mode,
+                    prompt_excerpt=body.prompt[:100], status="submitted",
+                )
                 insert_task(rec)
 
                 # If wait=True, poll and download
@@ -97,15 +92,15 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                 return {"task_id": task_id, "status": "submitted"}
 
         except TaskError as e:
-            update_task(rec.task_id, status="failed", error=str(e))
+            if rec is not None:
+                update_task(rec.task_id, status="failed", error=str(e))
             raise HTTPException(status_code=400, detail=f"TaskError: {e}")
         except MiniPicError as e:
-            update_task(rec.task_id, status="failed", error=str(e))
+            if rec is not None:
+                update_task(rec.task_id, status="failed", error=str(e))
             raise HTTPException(status_code=400, detail=f"{e.__class__.__name__}: {e}")
         except Exception as exc:  # noqa: BLE001
             log.exception("unexpected error in /api/create")
-            if rec.task_id != "pending":
-                update_task(rec.task_id, status="failed", error=str(exc))
             raise HTTPException(status_code=500, detail="internal")
 
     # ---------------------------------------------------------------- GET /api/tasks

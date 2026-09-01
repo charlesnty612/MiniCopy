@@ -187,7 +187,7 @@ def create_group() -> None:
 @click.option(
     "--resolution",
     default="768P",
-    help="Resolution: 540P, 720P, 768P, or 1080P. Default: 768P.",
+    help="Output resolution. H3 V2 officially supports 768P (default) and 2K.",
 )
 @click.option(
     "--wait/--no-wait",
@@ -261,7 +261,7 @@ def create_t2v(
 @click.option(
     "--resolution",
     default="768P",
-    help="Resolution: 540P, 720P, 768P, or 1080P. Default: 768P.",
+    help="Output resolution. H3 V2 officially supports 768P (default) and 2K.",
 )
 @click.option(
     "--wait/--no-wait",
@@ -360,7 +360,7 @@ def create_i2v(
 @click.option(
     "--resolution",
     default="768P",
-    help="Resolution: 540P, 720P, 768P, or 1080P. Default: 768P.",
+    help="Output resolution. H3 V2 officially supports 768P (default) and 2K.",
 )
 @click.option(
     "--wait/--no-wait",

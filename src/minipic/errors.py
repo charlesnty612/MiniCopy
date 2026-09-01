@@ -75,7 +75,7 @@ _CODE_TO_EXC = {
     1004: AuthError,
     1008: BalanceError,
     1026: SafetyError,
-    1039: InvalidParamsError,
+    1039: InvalidParamsError,  # token-limit, treated as a parameter error
     2013: InvalidParamsError,
     2049: AuthError,
     2056: BalanceError,
@@ -84,16 +84,17 @@ _CODE_TO_EXC = {
 
 def raise_for_code(payload: ApiErrorPayload) -> None:
     """Map an API error payload to the matching exception class and raise it."""
-    if payload.http_code is not None and 400 <= payload.http_code < 600:
-        # surface HTTP-level status as well
-        pass
-
     if payload.code in _CODE_TO_EXC:
         cls = _CODE_TO_EXC[payload.code]
         msg = f"[{payload.code}] {payload.message}"
+        if payload.http_code is not None:
+            msg += f" (http={payload.http_code})"
         if payload.request_id:
             msg += f" (request_id={payload.request_id})"
         raise cls(msg)
 
-    # Default: generic
-    raise MiniPicError(f"[{payload.code}] {payload.message}")
+    # Unknown code — fall through to generic, still surface the HTTP status if any.
+    msg = f"[{payload.code}] {payload.message}"
+    if payload.http_code is not None:
+        msg += f" (http={payload.http_code})"
+    raise MiniPicError(msg)
