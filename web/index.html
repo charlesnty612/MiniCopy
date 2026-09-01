@@ -596,8 +596,6 @@ async function uploadFile(fileInput) {
 async function maybeAutofillDuration(path) {
   const durInput = document.getElementById('duration');
   if (!durInput) return;
-  // Only fill when the input is empty — never overwrite user input.
-  if (String(durInput.value).trim() !== '') return;
   try {
     const r = await fetch(BASE + '/probe/video?path=' + encodeURIComponent(path));
     if (!r.ok) return;  // probe is best-effort; silently skip on failure.
