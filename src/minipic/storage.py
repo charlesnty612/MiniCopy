@@ -50,6 +50,10 @@ PREPARE_STATUS_COMMITTED = "committed"
 PREPARE_STATUS_EXPIRED = "expired"
 PREPARE_TTL_MS = 24 * 3600 * 1000   # 24h, then the row is considered expired
 
+# ----------------------------------------------------------- v0.1.4 upload sweep
+
+UPLOAD_TTL_MS = 24 * 60 * 60 * 1000  # 24h — reference uploads purged after this
+
 
 @dataclass
 class PrepareRecord:
@@ -332,6 +336,44 @@ def cleanup_expired_prepares(now_ms: Optional[int] = None) -> int:
             (PREPARE_STATUS_EXPIRED, PREPARE_STATUS_PREPARED, now),
         )
     return cur.rowcount
+
+
+# ============================================================ v0.1.4 upload sweep
+
+
+def cleanup_expired_uploads(
+    user_data_dir: Path, now_ms: Optional[int] = None
+) -> int:
+    """Delete uploaded reference files older than ``UPLOAD_TTL_MS``.
+
+    Walks ``<user_data_dir>/uploads/`` and unlinks every entry whose
+    ``mtime`` is older than the cutoff. Skips ``.json`` siblings (used
+    by ``media._upload_cache_path``). Missing dir is a no-op. Returns
+    the number of files deleted. Intended for lazy invocation from
+    existing ``cleanup_expired_prepares`` call sites.
+    """
+    uploads_dir = Path(user_data_dir) / "uploads"
+    if not uploads_dir.is_dir():
+        return 0
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    cutoff_ms = now - UPLOAD_TTL_MS
+    deleted = 0
+    for entry in uploads_dir.iterdir():
+        if entry.suffix.lower() == ".json":
+            continue
+        try:
+            stat = entry.stat()
+        except OSError:
+            continue
+        mtime_ms = int(stat.st_mtime * 1000)
+        if mtime_ms < cutoff_ms:
+            try:
+                entry.unlink()
+                deleted += 1
+            except OSError:
+                # File might be in use or already gone — skip silently.
+                continue
+    return deleted
 
 
 def _row_to_prepare(row: sqlite3.Row) -> PrepareRecord:

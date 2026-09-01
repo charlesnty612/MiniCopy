@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.1.4] - 2026-09-01
+
+### Added
+- **前端 picker 按钮**：参考素材行（i2v 首帧 + r2v image / video / audio 三种动态行）每行多了个 📎 按钮，点击弹出**浏览器原生 file 选择对话框**。选定文件后自动 `POST /api/upload`，返回的绝对路径写回原 `<input type=text>`，与手填路径完全等价。**手填能力零破坏**——input / select / 现有 `buildPayload()` 逻辑一行未改。
+- **后端 `POST /api/upload`**：multipart 上传，参数 `file: UploadFile`。返回 `{path, kind, size, content_type, sha256}`，其中 `path` 是 `%APPDATA%/minipic/uploads/<uuid32hex>.<ext>` 的绝对路径。
+- **MIME 白名单**（最小集，7 种）：
+  - `image/png, image/jpeg, image/webp`
+  - `video/mp4, video/quicktime`
+  - `audio/mpeg, audio/wav`
+  - 不在白名单 → 400 + 中文文案 `unsupported content_type: ...; allowed: [...]`。
+- **50MB 大小限制**：与 `web.py` 文案 "≤50MB" 对齐。流式 1MB chunk 写入，**累计字节超限立即 unlink 落盘文件并返 400**，不会留下半个文件。
+- **服务端硬命名 + 路径安全**：客户端传的 `filename`（如 `../../etc/passwd.png`）**完全被忽略**，磁盘名固定为 `uuid.uuid4().hex + _MIME_TO_EXT[content_type]`。白名单 / 后缀 / 常量硬编码在 `web.py` 顶部（`_ALLOWED_MIME` / `_MIME_TO_EXT` / `_MIME_TO_KIND`）。
+- **24h TTL sweep**：`storage.UPLOAD_TTL_MS = 24h` + `cleanup_expired_uploads(user_data_dir)`。挂在现有 `cleanup_expired_prepares()` 两个懒触发点（`GET /api/prepare/{id}` + `GET /api/prepares`），与 prepare 24h 过期同一节奏。**`.json` 同名缓存文件（如 `media._upload_cache_path`）跳过**，不会被扫掉。
+
+### Changed
+- `index.html` 三个 ref-row 容器结构扩展（i2v 静态行 + addRef 三分支各多 1 个按钮 + 1 个 hidden `<input type="file">`）。`buildPayload()` 不动，原 DOM 选择器路径 `.querySelector('input')` / `.querySelector('select')` 仍然有效（hidden file input 是 type=file，selector 不冲突）。
+- `web.py` import 区追加 `hashlib`, `File`, `UploadFile`（FastAPI 标配），`config.user_data_path` / `config._user_data_dir`（sweep 需要 user data 根路径）。
+
+### Non-goals（v0.1.4 不做）
+- **client-side file-size 提示**：仅服务端校验。超大文件用户体验差（要等上传完才知道失败），留 v0.1.4+。
+- **上传进度条**：当前 fetch 不读 `ReadableStream.body` 进度，留 v0.1.4+。
+- **拖拽上传**：当前只支持 picker，留 v0.1.5+。
+- **病毒扫描 / 内容嗅探**：白名单 + 大小限制够用，签名头校验不在 v0.1.4 范围。
+
+### Verification
+- **428 / 428 passing**（原 422 + 5 个 web 上传测试 + 1 个 storage sweep 测试 = 0 fail）
+- 新增覆盖：
+  - `TestApiUpload::test_upload_image_success` — 200 + 字段齐全 + 落盘文件存在 + uuid 命名
+  - `TestApiUpload::test_upload_path_traversal` — `../../etc/passwd.png` 客户端名不进磁盘
+  - `TestApiUpload::test_upload_size_limit` — 51MB → 400 + uploads/ 不留残骸
+  - `TestApiUpload::test_upload_mime_reject` — `.exe` (`application/octet-stream`) → 400
+  - `TestApiUpload::test_upload_audio_accepts_mp3` — audio/mpeg 在白名单
+  - `TestCleanupExpiredUploads::test_deletes_old_keeps_new_and_json` — 25h 前的 png 删、新的留、`.json` 同名缓存留
+  - `TestCleanupExpiredUploads::test_no_uploads_dir_is_noop` — 缺目录不抛
+  - `TestCleanupExpiredUploads::test_returns_zero_when_nothing_to_clean` — 全新文件不被误删
+- 现有 web / storage / config / errors / cli 422 测试零回归
+- 3 个 `test_media.py` ffmpeg-binary 测试在没装 `imageio-ffmpeg` 的环境会 fail，与 v0.1.4 改动**无关**（依赖 ffmpeg 二进制，没装就会 fail）
+
 ## [0.1.3b] - 2026-09-01
 
 ### Added

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
-from fastapi import Body, FastAPI, HTTPException, Response
+from fastapi import Body, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -21,10 +22,12 @@ from .config import (
     MODEL_CONSTRAINTS,
     Config,
     _user_config_path,
+    _user_data_dir,
     load_config,
     mask_key,
     require_api_key,
     save_config,
+    user_data_path,
     validate_model_params,
 )
 from .client import MiniMaxClient
@@ -47,6 +50,7 @@ from .storage import (
     PrepareRecord,
     TaskRecord,
     cleanup_expired_prepares,
+    cleanup_expired_uploads,
     delete_prepare,
     get_prepare,
     get_task,
@@ -60,6 +64,26 @@ from .storage import (
 from . import media as _media_module
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# v0.1.4 — upload allow-list + size cap
+# ---------------------------------------------------------------------------
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 与文案 "≤50MB" 对齐 (web.py:172 错误提示一致)
+_ALLOWED_IMAGE_MIME = {"image/png", "image/jpeg", "image/webp"}
+_ALLOWED_VIDEO_MIME = {"video/mp4", "video/quicktime"}
+_ALLOWED_AUDIO_MIME = {"audio/mpeg", "audio/wav"}
+_ALLOWED_MIME = _ALLOWED_IMAGE_MIME | _ALLOWED_VIDEO_MIME | _ALLOWED_AUDIO_MIME
+_MIME_TO_EXT = {
+    "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp",
+    "video/mp4": "mp4", "video/quicktime": "mov",
+    "audio/mpeg": "mp3", "audio/wav": "wav",
+}
+_MIME_TO_KIND = {
+    "image/png": "image", "image/jpeg": "image", "image/webp": "image",
+    "video/mp4": "video", "video/quicktime": "video",
+    "audio/mpeg": "audio", "audio/wav": "audio",
+}
+_UPLOAD_CHUNK_BYTES = 1024 * 1024  # 1MB streaming chunks
 
 # ---------------------------------------------------------------------------
 # App factory
@@ -203,6 +227,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     def api_get_prepare(prepare_id: str) -> dict[str, Any]:
         """Return a previously-created prepare plan. 410 Gone if expired."""
         cleanup_expired_prepares()  # lazy: mark stale rows on every lookup
+        cleanup_expired_uploads(_user_data_dir())  # v0.1.4: sweep >24h uploads
         rec = get_prepare(prepare_id)
         if rec is None:
             raise HTTPException(status_code=404, detail="prepare not found")
@@ -283,6 +308,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     def api_list_prepares() -> list[dict[str, Any]]:
         """List recent (non-expired) prepare records — handy for the UI."""
         cleanup_expired_prepares()
+        cleanup_expired_uploads(_user_data_dir())  # v0.1.4: sweep >24h uploads
         return [
             {
                 "prepare_id": r.prepare_id,
@@ -399,6 +425,107 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             "masked": mask_key(cfg.api_key),
             "saved_to": str(saved_to),
             "source": _detect_key_source(cfg),
+        }
+
+    # -------------------------------------------------------- POST /api/upload (v0.1.4)
+    @app.post("/api/upload")
+    async def api_upload(
+        request: Request, file: UploadFile = File(...)
+    ) -> dict[str, Any]:
+        """Accept a reference media file (image/video/audio) and persist it to disk.
+
+        Hard guards
+        -----------
+        * MIME allow-list (7 types) — anything else → 400.
+        * 50MB size cap — checked up-front via Content-Length when present,
+          and re-checked while streaming. On overflow the partial file is
+          unlinked and 400 is returned.
+        * Server-side ``uuid.uuid4().hex`` filename — the client-supplied
+          ``filename`` is **never** used as a disk name (path-traversal
+          protection). Original name is intentionally discarded.
+
+        Returns
+        -------
+        ``{path, kind, size, content_type, sha256}``. The ``path`` is an
+        absolute filesystem path inside the user data dir's ``uploads/``
+        folder; the caller (``buildPayload``) only stores it as a string
+        and the backend later resolves it via ``resolve_reference``.
+        """
+        # Pre-flight: Content-Length header. Fast-fail large bodies without
+        # allocating disk buffers. Header may be missing (chunked transfer),
+        # in which case the streaming guard below still catches overruns.
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                cl_int = int(cl)
+            except ValueError:
+                cl_int = -1
+            if cl_int > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"file too large: Content-Length={cl_int} > "
+                        f"{MAX_UPLOAD_BYTES} (50MB cap)"
+                    ),
+                )
+
+        ct = (file.content_type or "").lower()
+        if ct not in _ALLOWED_MIME:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unsupported content_type: {ct or '<missing>'}; "
+                    f"allowed: {sorted(_ALLOWED_MIME)}"
+                ),
+            )
+        ext = _MIME_TO_EXT[ct]
+        kind = _MIME_TO_KIND[ct]
+
+        uploads_dir = user_data_path("uploads")
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        target_name = f"{uuid.uuid4().hex}.{ext}"
+        target = uploads_dir / target_name
+
+        hasher = hashlib.sha256()
+        written = 0
+        try:
+            with target.open("wb") as out:
+                while True:
+                    chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_UPLOAD_BYTES:
+                        # Over cap — abort. Close first so we can unlink on
+                        # Windows without "file in use" errors.
+                        out.close()
+                        try:
+                            target.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"file too large: >{MAX_UPLOAD_BYTES} bytes "
+                                f"(50MB)"
+                            ),
+                        )
+                    hasher.update(chunk)
+                    out.write(chunk)
+        finally:
+            await file.close()
+
+        sha = hasher.hexdigest()
+        log.info(
+            "upload: saved %s (%s, %d bytes, sha256=%s)",
+            target_name, ct, written, sha[:12],
+        )
+        return {
+            "path": str(target.resolve()),
+            "kind": kind,
+            "size": written,
+            "content_type": ct,
+            "sha256": sha,
         }
 
     return app

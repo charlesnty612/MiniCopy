@@ -1320,6 +1320,162 @@ class TestApiCreateLegacy:
         assert resp.status_code == 200
 
 
+# ============================================================ v0.1.4 /api/upload
+class TestApiUpload:
+    PNG_1x1 = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\rIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe\x02\xfe\xa3z\x1fR~"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    def test_upload_image_success(
+        self, web_client: TestClient
+    ) -> None:
+        resp = web_client.post(
+            "/api/upload",
+            files={"file": ("photo.png", self.PNG_1x1, "image/png")},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        # Every required field is present
+        assert set(data.keys()) == {"path", "kind", "size", "content_type", "sha256"}
+        assert data["kind"] == "image"
+        assert data["content_type"] == "image/png"
+        assert data["size"] == len(self.PNG_1x1)
+        # sha256 is hex, 64 chars
+        assert len(data["sha256"]) == 64
+        # Path must exist on disk and live under user data dir
+        p = Path(data["path"])
+        assert p.is_file()
+        assert p.suffix == ".png"
+        assert p.read_bytes() == self.PNG_1x1
+        # Filename is uuid-style (32 hex chars), NOT the client-provided name
+        assert p.stem != "photo"
+        assert len(p.stem) == 32
+        int(p.stem, 16)  # parseable as hex
+
+    def test_upload_path_traversal(
+        self, web_client: TestClient
+    ) -> None:
+        """A traversal-style client filename must NOT bleed into disk."""
+        evil_name = "../../etc/passwd.png"
+        resp = web_client.post(
+            "/api/upload",
+            files={"file": (evil_name, self.PNG_1x1, "image/png")},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        p = Path(data["path"])
+        # The disk filename must NOT contain "passwd" or any slash
+        assert "passwd" not in p.name
+        assert "/" not in p.name
+        assert "\\" not in p.name
+        # The stored path must be inside user_data/uploads/
+        from minipic.config import _user_data_dir
+        uploads = _user_data_dir() / "uploads"
+        assert p.parent.resolve() == uploads.resolve()
+
+    def test_upload_size_limit(
+        self, web_client: TestClient
+    ) -> None:
+        """51MB payload → 400, no partial file left behind.
+
+        With Content-Length present (httpx default), the pre-flight guard
+        fires first; the detail message references Content-Length.
+        """
+        from minipic.config import _user_data_dir
+        uploads = _user_data_dir() / "uploads"
+        if uploads.is_dir():
+            before = {p.name for p in uploads.iterdir()}
+        else:
+            before = set()
+        big = b"x" * (51 * 1024 * 1024)
+        resp = web_client.post(
+            "/api/upload",
+            files={"file": ("big.png", big, "image/png")},
+        )
+        assert resp.status_code == 400, resp.text
+        assert "Content-Length" in resp.json()["detail"]
+        if uploads.is_dir():
+            after = {p.name for p in uploads.iterdir()}
+            assert after == before
+
+    def test_upload_size_limit_streaming(
+        self, web_client: TestClient
+    ) -> None:
+        """Oversize without Content-Length → 400 via streaming guard.
+
+        Simulates a chunked / unknown-length body by sending raw multipart
+        bytes with the Content-Length header stripped (httpx normally
+        auto-sets it). Verifies the streaming byte-counter guard is the
+        fallback when the pre-flight cannot run.
+        """
+        import httpx
+
+        from minipic.config import _user_data_dir
+        uploads = _user_data_dir() / "uploads"
+        if uploads.is_dir():
+            before = {p.name for p in uploads.iterdir()}
+        else:
+            before = set()
+        # Construct a multipart body that's 51MB total.
+        boundary = "----minipicboundaryabcdef0123456789"
+        head = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="big.png"\r\n'
+            f"Content-Type: image/png\r\n\r\n"
+        ).encode()
+        tail = f"\r\n--{boundary}--\r\n".encode()
+        payload_size = 51 * 1024 * 1024
+        padding = b"x" * (
+            payload_size - len(head) - len(b"PNG") - len(tail)
+        )
+        # Force Content-Length to a small number so pre-flight passes,
+        # but the actual streamed body is >50MB. Real chunked-encoding
+        # clients do exactly this.
+        fake_cl = str(len(head) + 100).encode()
+        body = head + b"PNG" + padding + tail
+        resp = web_client.post(
+            "/api/upload",
+            content=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": fake_cl,
+            },
+        )
+        # Either pre-flight OR streaming guard caught it (both 400).
+        assert resp.status_code == 400, resp.text
+        if uploads.is_dir():
+            after = {p.name for p in uploads.iterdir()}
+            assert after == before
+
+    def test_upload_mime_reject(
+        self, web_client: TestClient
+    ) -> None:
+        """An octet-stream (or any non-allow-listed) MIME → 400."""
+        resp = web_client.post(
+            "/api/upload",
+            files={"file": ("malware.exe", b"MZ\x00\x00", "application/octet-stream")},
+        )
+        assert resp.status_code == 400, resp.text
+        assert "unsupported" in resp.json()["detail"].lower()
+
+    def test_upload_audio_accepts_mp3(
+        self, web_client: TestClient
+    ) -> None:
+        """Spot-check: audio/mpeg is on the allow-list."""
+        resp = web_client.post(
+            "/api/upload",
+            files={"file": ("track.mp3", b"ID3\x03\x00" + b"\x00" * 100,
+                            "audio/mpeg")},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["kind"] == "audio"
+        assert resp.json()["content_type"] == "audio/mpeg"
+
+
 # ============================================================ v0.1.3b _maybe_enhance_prompt
 class TestMaybeEnhancePrompt:
     @pytest.mark.asyncio

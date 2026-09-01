@@ -17,7 +17,9 @@ from minipic.storage import (
     PREPARE_TTL_MS,
     PrepareRecord,
     TaskRecord,
+    UPLOAD_TTL_MS,
     cleanup_expired_prepares,
+    cleanup_expired_uploads,
     db_path,
     delete_prepare,
     get_prepare,
@@ -416,4 +418,50 @@ class TestPrepareInitDbIdempotent:
             assert n == 1
         finally:
             conn.close()
+
+
+# ============================================================ v0.1.4 upload sweep
+class TestCleanupExpiredUploads:
+    def _touch(self, path: Path, mtime: float) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        import os
+        os.utime(str(path), (mtime, mtime))
+
+    def test_deletes_old_keeps_new_and_json(
+        self, tmp_path: Path
+    ) -> None:
+        """Old png → deleted; fresh png → kept; .json sibling → kept."""
+        uploads = tmp_path / "user_data" / "uploads"
+        uploads.mkdir(parents=True)
+        now = int(time.time() * 1000)
+        # Old png: mtime 25h ago
+        old_png = uploads / "olddeadbeefcafebabe.png"
+        self._touch(old_png, (now - UPLOAD_TTL_MS - 1000) / 1000)
+        # Fresh png: mtime now
+        new_png = uploads / "freshdeadbeefcafebabe.png"
+        self._touch(new_png, now / 1000)
+        # Old .json sibling — must NEVER be deleted
+        old_json = uploads / "olddeadbeefcafebabe.png.json"
+        self._touch(old_json, (now - UPLOAD_TTL_MS - 1000) / 1000)
+
+        # Run sweep with explicit now=now_ms
+        n = cleanup_expired_uploads(tmp_path / "user_data", now_ms=now)
+        assert n == 1  # only the old png
+        assert not old_png.exists()
+        assert new_png.exists()
+        assert old_json.exists()
+
+    def test_no_uploads_dir_is_noop(self, tmp_path: Path) -> None:
+        n = cleanup_expired_uploads(tmp_path / "user_data")
+        assert n == 0
+
+    def test_returns_zero_when_nothing_to_clean(self, tmp_path: Path) -> None:
+        uploads = tmp_path / "user_data" / "uploads"
+        uploads.mkdir(parents=True)
+        fresh = uploads / "fresh.png"
+        self._touch(fresh, time.time())
+        n = cleanup_expired_uploads(tmp_path / "user_data")
+        assert n == 0
+        assert fresh.exists()
 

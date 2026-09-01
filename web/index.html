@@ -184,6 +184,8 @@ details.advanced[open] summary { margin-bottom: 8px; }
       <select>
         <option value="first_frame" selected>first_frame</option>
       </select>
+      <button type="button" class="btn btn-small" onclick="pickFile(this, 'image/png,image/jpeg,image/webp')">📎</button>
+      <input type="file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="uploadFile(this)">
     </div>
   </div>
 
@@ -299,15 +301,21 @@ function addRef(type) {
         '<option value="reference_image" selected>reference_image</option>' +
         '<option value="first_frame">first_frame</option>' +
       '</select>' +
+      '<button type="button" class="btn btn-small" onclick="pickFile(this, \'image/png,image/jpeg,image/webp\')">📎</button>' +
+      '<input type="file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="uploadFile(this)">' +
       '<button class="btn btn-small btn-danger" onclick="this.parentNode.remove()">×</button>';
   } else if (type === 'video') {
     row.innerHTML =
       '<input type="text" placeholder="/path/to/video.mp4">' +
       '<input type="text" placeholder="clips (0:5,30:5)" title="留空自动采样">' +
+      '<button type="button" class="btn btn-small" onclick="pickFile(this, \'video/mp4,video/quicktime\')">📎</button>' +
+      '<input type="file" accept="video/mp4,video/quicktime" style="display:none" onchange="uploadFile(this)">' +
       '<button class="btn btn-small btn-danger" onclick="this.parentNode.remove()">×</button>';
   } else {
     row.innerHTML =
       '<input type="text" placeholder="/path/to/audio.mp3">' +
+      '<button type="button" class="btn btn-small" onclick="pickFile(this, \'audio/mpeg,audio/wav\')">📎</button>' +
+      '<input type="file" accept="audio/mpeg,audio/wav" style="display:none" onchange="uploadFile(this)">' +
       '<button class="btn btn-small btn-danger" onclick="this.parentNode.remove()">×</button>';
   }
   container.appendChild(row);
@@ -558,6 +566,34 @@ async function submitTaskLegacy() {
 // Keep `submitTask` as an alias for backward-compat in case any browser
 // extension / automation still calls the old function name.
 async function submitTask() { return onSubmitClick(); }
+
+// ============================================================ v0.1.4 file upload helpers
+async function uploadFile(fileInput) {
+  const file = fileInput.files[0]; if (!file) return;
+  const btn = fileInput.previousElementSibling;
+  // text input is always the first <input type=text> sibling of the picker button
+  const txtInput = fileInput.parentNode.querySelector('input[type=text]');
+  const origText = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳';
+  const fd = new FormData(); fd.append('file', file);
+  try {
+    const r = await fetch(BASE + '/upload', { method: 'POST', body: fd });
+    if (!r.ok) {
+      let msg = r.statusText;
+      try { msg = (await r.json()).detail || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const data = await r.json();
+    if (txtInput) txtInput.value = data.path;
+  } catch (e) { alert('上传失败: ' + e.message); }
+  finally { btn.disabled = false; btn.textContent = origText; fileInput.value = ''; }
+}
+
+function pickFile(btn, accept) {
+  const fi = btn.nextElementSibling;
+  if (accept) fi.accept = accept;
+  fi.click();
+}
 
 async function loadTasks() {
   try {
