@@ -3,17 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Body, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from .config import Config, load_config, require_api_key
+from .config import (
+    API_MODELS,
+    MODEL_CONSTRAINTS,
+    Config,
+    _user_config_path,
+    load_config,
+    mask_key,
+    require_api_key,
+    save_config,
+    validate_model_params,
+)
 from .client import MiniMaxClient
 from .errors import ConfigError, MiniPicError, TaskError
 from .media import prepare_reference_video, resolve_reference
@@ -161,6 +173,60 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="{task_id}.mp4"'},
         )
 
+    # -------------------------------------------------------- GET /api/config
+    @app.get("/api/config")
+    def api_get_config() -> dict[str, Any]:
+        """Return masked API key + source, plus model metadata for the UI.
+
+        Never returns the raw key.
+        """
+        cfg = app.state.cfg
+        return {
+            "has_key": cfg.is_valid(),
+            "masked": mask_key(cfg.api_key),
+            "source": _detect_key_source(cfg),
+            "user_config_path": str(_user_config_path()),
+            "models": [
+                {
+                    "name": name,
+                    "resolutions": MODEL_CONSTRAINTS[name]["resolutions"],
+                    "duration_min": MODEL_CONSTRAINTS[name]["duration_min"],
+                    "duration_max": MODEL_CONSTRAINTS[name]["duration_max"],
+                }
+                for name in API_MODELS
+            ],
+            "model_default": "MiniMax-H3",
+        }
+
+    # -------------------------------------------------------- POST /api/config
+    @app.post("/api/config")
+    def api_set_config(payload: Annotated[ConfigBody, Body()]) -> dict[str, Any]:
+        """Persist a new API key to the user config dir and reload cfg.
+
+        Replaces ``app.state.cfg.api_key`` directly (no env override) so the
+        next /api/create can use it. If the env var ``MINIMAX_API_KEY`` is
+        also set, that value will shadow this one on the next full reload —
+        the UI surfaces that fact via the ``source`` field of /api/config.
+        """
+        cfg = app.state.cfg
+        new_key = payload.api_key.strip()
+        if not new_key:
+            raise HTTPException(status_code=400, detail="api_key must not be empty")
+        cfg.api_key = new_key
+        try:
+            saved_to = save_config(cfg, scope="user")
+        except OSError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"failed to write config: {e}",
+            )
+        return {
+            "ok": True,
+            "masked": mask_key(cfg.api_key),
+            "saved_to": str(saved_to),
+            "source": _detect_key_source(cfg),
+        }
+
     return app
 
 
@@ -170,14 +236,19 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
 
 class CreateBody(BaseModel):
     mode: Annotated[str, Field(pattern=r"^(t2v|i2v|r2v)$")]
+    model: Annotated[str, Field(pattern=r"^(MiniMax-H3|MiniMax-H3-Max)$")] = "MiniMax-H3"
     prompt: str
     duration: int = Field(ge=4, le=15, default=10)
     ratio: Optional[str] = None  # null means "not supplied"
-    resolution: Annotated[str, Field(pattern=r"^(768P|2K)$")] = "768P"
+    resolution: Annotated[str, Field(pattern=r"^(480P|768P|2K)$")] = "768P"
     ref_images: list[dict[str, Any]] = Field(default_factory=list)
     ref_videos: list[dict[str, Any]] = Field(default_factory=list)
     ref_audios: list[dict[str, Any]] = Field(default_factory=list)
     wait: bool = False
+
+
+class ConfigBody(BaseModel):
+    api_key: Annotated[str, Field(min_length=1, max_length=512)]
 
 
 def _validate_mode(body: CreateBody) -> None:
@@ -227,6 +298,15 @@ def _validate_mode(body: CreateBody) -> None:
                 detail="r2v mode requires at least one reference (image, video, or audio)",
             )
 
+    # Model-specific parameter validation (resolution, duration). Raises
+    # HTTPException(400) with a user-friendly message.
+    try:
+        validate_model_params(
+            body.model, resolution=body.resolution, duration=body.duration
+        )
+    except ConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 async def _submit_task(client: MiniMaxClient, body: CreateBody) -> tuple[str, list[dict[str, Any]]]:
     """Build content[] and submit. Returns (task_id, content_items)."""
@@ -273,7 +353,7 @@ async def _submit_task(client: MiniMaxClient, body: CreateBody) -> tuple[str, li
         ratio = body.ratio or "adaptive"
 
     task_id = await client.create_video_task(
-        model="MiniMax-H3",
+        model=body.model,
         content=content,
         duration=body.duration,
         resolution=body.resolution,
@@ -319,6 +399,37 @@ def _record_to_dict(rec: TaskRecord) -> dict[str, Any]:
         "error": rec.error,
         "extra": rec.extra,
     }
+
+
+def _detect_key_source(cfg: Config) -> str:
+    """Best-effort: report which config layer the live key came from.
+
+    Priority matches ``load_config()``: env > local config.json > user config
+    dir. Returns "none" when no key is configured anywhere.
+    """
+    if os.environ.get("MINIMAX_API_KEY", "").strip():
+        return "env"
+    if cfg.api_key:
+        # Both local and user dir could host the key; we report whichever the
+        # file system currently has. The order mirrors load_config (local
+        # wins over user), so check local first.
+        local_path = Path.cwd() / "config.json"
+        if local_path.is_file():
+            try:
+                data = json.loads(local_path.read_text(encoding="utf-8"))
+                if (data.get("api_key") or "").strip():
+                    return "local"
+            except (OSError, ValueError):
+                pass
+        user_path = _user_config_path()
+        if user_path.is_file():
+            try:
+                data = json.loads(user_path.read_text(encoding="utf-8"))
+                if (data.get("api_key") or "").strip():
+                    return "user"
+            except (OSError, ValueError):
+                pass
+    return "none"
 
 
 # ---------------------------------------------------------------------------

@@ -606,12 +606,23 @@ class TestVideosCommand:
 
 # --------------------------------------------------------------------------- web command
 class TestWebCommand:
-    def test_requires_api_key(
+    def test_no_api_key_starts_anyway(
         self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(cli_mod, "load_config", lambda: Config())
+        """As of v0.1.2, `minipic web` no longer requires an API key at startup.
+
+        New users can configure the key through the UI (POST /api/config)
+        before submitting a task. This is the whole point of the API Key
+        button.
+        """
+        import uvicorn
+        called: list[dict] = []
+        monkeypatch.setattr(uvicorn, "run", lambda *a, **k: called.append(1))
+        monkeypatch.setattr(cli_mod, "load_config", lambda: Config())  # no key
         result = runner.invoke(main, ["web"])
-        assert result.exit_code != 0
+        # The command should start uvicorn successfully even without a key.
+        assert result.exit_code == 0, result.output
+        assert len(called) == 1
 
     def test_starts_uvicorn(
         self, runner: CliRunner, fake_config: Config, monkeypatch: pytest.MonkeyPatch
@@ -626,6 +637,99 @@ class TestWebCommand:
         assert len(called) == 1
         # Verify the port was forwarded
         assert called[0]["kwargs"].get("port") == 9999 or any("9999" in str(a) for a in called[0]["args"])
+
+
+# --------------------------------------------------------------------------- create --model
+class TestCreateModelFlag:
+    def test_t2v_default_model_is_h3(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        fake_client.create_video_task.return_value = "tid-1"
+        result = runner.invoke(main, [
+            "create", "t2v", "--prompt", "x", "--ratio", "16:9",
+        ])
+        assert result.exit_code == 0, result.output
+        assert fake_client.create_video_task.await_args.kwargs["model"] == "MiniMax-H3"
+
+    def test_t2v_explicit_h3_max(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        fake_client.create_video_task.return_value = "tid-max"
+        result = runner.invoke(main, [
+            "create", "t2v", "--prompt", "x", "--ratio", "16:9",
+            "--model", "MiniMax-H3-Max",
+            "--resolution", "768P", "--duration", "5",
+        ])
+        assert result.exit_code == 0, result.output
+        kwargs = fake_client.create_video_task.await_args.kwargs
+        assert kwargs["model"] == "MiniMax-H3-Max"
+        assert kwargs["resolution"] == "768P"
+        assert kwargs["duration"] == 5
+
+    def test_t2v_h3_max_rejects_2k(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        result = runner.invoke(main, [
+            "create", "t2v", "--prompt", "x", "--ratio", "16:9",
+            "--model", "MiniMax-H3-Max", "--resolution", "2K",
+        ])
+        assert result.exit_code != 0
+        assert "2K" in result.output
+
+    def test_t2v_h3_max_rejects_duration_4(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        result = runner.invoke(main, [
+            "create", "t2v", "--prompt", "x", "--ratio", "16:9",
+            "--model", "MiniMax-H3-Max", "--duration", "4",
+        ])
+        assert result.exit_code != 0
+        assert "duration" in result.output.lower()
+
+    def test_invalid_model_choice_rejected(
+        self, runner: CliRunner, fake_config: Config
+    ) -> None:
+        result = runner.invoke(main, [
+            "create", "t2v", "--prompt", "x", "--ratio", "16:9",
+            "--model", "MiniMax-X9",
+        ])
+        assert result.exit_code != 0
+
+    def test_i2v_with_h3_max(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        fake_client.create_video_task.return_value = "tid-i2v-max"
+        result = runner.invoke(main, [
+            "create", "i2v",
+            "--prompt", "x",
+            "--ref-image", "https://cdn/photo.jpg",
+            "--model", "MiniMax-H3-Max",
+            "--resolution", "768P", "--duration", "6",
+        ])
+        assert result.exit_code == 0, result.output
+        kwargs = fake_client.create_video_task.await_args.kwargs
+        assert kwargs["model"] == "MiniMax-H3-Max"
+
+    def test_r2v_with_h3_max(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient,
+        tmp_path: Path,
+    ) -> None:
+        img = tmp_path / "img.jpg"
+        img.write_bytes(b"x")
+        fake_client.upload_and_resolve.return_value = "https://cdn/uploaded.jpg"
+        fake_client.create_video_task.return_value = "tid-r2v-max"
+        result = runner.invoke(main, [
+            "create", "r2v",
+            "--prompt", "x",
+            "--ref-image", str(img),
+            "--model", "MiniMax-H3-Max",
+            "--resolution", "480P", "--duration", "5",
+        ])
+        assert result.exit_code == 0, result.output
+        kwargs = fake_client.create_video_task.await_args.kwargs
+        assert kwargs["model"] == "MiniMax-H3-Max"
+        assert kwargs["resolution"] == "480P"
+        assert kwargs["duration"] == 5
 
 
 # --------------------------------------------------------------------------- _print_task_record

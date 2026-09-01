@@ -63,11 +63,50 @@ input:disabled, select:disabled { background: #eee; color: #888; }
 #detail-panel h3 { font-size: 0.95rem; margin-bottom: 8px; }
 
 .checkbox-label { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-weight: normal; font-size: 0.85rem; cursor: pointer; }
+
+/* API Key header pill */
+.header-row { display: flex; align-items: center; justify-content: space-between; max-width: 640px; margin-bottom: 8px; }
+.header-row h1 { margin-bottom: 0; }
+.key-pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid #ccc; border-radius: 14px; background: #fafafa; font-size: 0.78rem; cursor: pointer; }
+.key-pill:hover { background: #eee; }
+.key-pill .dot { width: 8px; height: 8px; border-radius: 50%; }
+.key-pill.ok .dot { background: #4a4; }
+.key-pill.missing .dot { background: #c44; }
+
+/* Modal (native <dialog>) */
+dialog { border: 1px solid #ccc; border-radius: 6px; padding: 18px 20px; max-width: 460px; box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
+dialog::backdrop { background: rgba(0,0,0,0.3); }
+dialog h3 { margin-bottom: 8px; font-size: 1rem; }
+dialog .row { margin: 10px 0; }
+dialog .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+dialog input[type=password] { width: 100%; padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; font-size: 0.9rem; font-family: monospace; }
+dialog .status-line { font-size: 0.8rem; color: #555; margin-bottom: 8px; }
+dialog .status-line code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 0.78rem; }
 </style>
 </head>
 <body>
-<h1>minipic</h1>
+<div class="header-row">
+  <h1>minipic</h1>
+  <button id="key-pill" class="key-pill missing" onclick="openKeyDialog()" title="点击配置 API Key">
+    <span class="dot"></span><span id="key-pill-label">API Key: 未配置</span>
+  </button>
+</div>
 <p class="sub">MiniMax H3 视频生成 · 本地 UI</p>
+
+<dialog id="key-dialog">
+  <h3>配置 API Key</h3>
+  <div class="status-line" id="key-status-line">加载中…</div>
+  <div class="row">
+    <label for="key-input" style="display:block;margin-bottom:4px;font-size:0.85rem;font-weight:600">输入新 Key</label>
+    <input type="password" id="key-input" placeholder="eyJhbGciOi..." autocomplete="off" />
+    <div style="font-size:0.75rem;color:#888;margin-top:4px">Key 保存在本机用户配置目录（<code id="key-save-path">%APPDATA%\minipic\config.json</code>），明文存盘。</div>
+  </div>
+  <div id="key-msg" style="font-size:0.85rem;margin-top:4px"></div>
+  <div class="actions">
+    <button class="btn" onclick="closeKeyDialog()">取消</button>
+    <button class="btn btn-primary" id="key-save-btn" onclick="saveKey()">保存</button>
+  </div>
+</dialog>
 
 <div class="card">
   <h2>创建任务</h2>
@@ -78,10 +117,16 @@ input:disabled, select:disabled { background: #eee; color: #888; }
     <label><input type="radio" name="mode" value="r2v" checked> r2v（多模态参考）</label>
   </div>
 
+  <label for="model">模型</label>
+  <select id="model">
+    <option value="MiniMax-H3" selected>MiniMax-H3（默认 · 768P/2K · 4-15s）</option>
+    <option value="MiniMax-H3-Max">MiniMax-H3-Max（480P/768P · 5-15s）</option>
+  </select>
+
   <label for="prompt">提示词</label>
   <textarea id="prompt" placeholder="描述你想生成的视频内容"></textarea>
 
-  <label for="duration">时长（秒，4-15）</label>
+  <label for="duration">时长（秒，<span id="duration-range-label">4-15</span>）</label>
   <input type="number" id="duration" value="10" min="4" max="15">
 
   <label for="ratio">比例（t2v 专用）</label>
@@ -100,6 +145,7 @@ input:disabled, select:disabled { background: #eee; color: #888; }
   <select id="resolution">
     <option value="768P" selected>768P</option>
     <option value="2K">2K</option>
+    <option value="480P">480P</option>
   </select>
 
   <!-- i2v: one image row -->
@@ -349,6 +395,129 @@ function escHtml(s) {
 // Poll
 loadTasks();
 setInterval(loadTasks, 5000);
+
+// -------- API Key dialog --------
+let modelConstraints = null;  // populated by loadConfigStatus()
+
+function applyModelConstraints() {
+  if (!modelConstraints) return;
+  const model = $('model').value;
+  const c = modelConstraints[model];
+  if (!c) return;
+
+  // duration range
+  const dur = $('duration');
+  dur.min = c.duration_min;
+  dur.max = c.duration_max;
+  $('duration-range-label').textContent = c.duration_min + '-' + c.duration_max;
+  if (parseInt(dur.value, 10) < c.duration_min) dur.value = c.duration_min;
+  if (parseInt(dur.value, 10) > c.duration_max) dur.value = c.duration_max;
+
+  // resolution options — keep only the ones this model supports
+  const res = $('resolution');
+  const prev = res.value;
+  res.innerHTML = '';
+  c.resolutions.forEach(function(r, i) {
+    const opt = document.createElement('option');
+    opt.value = r;
+    opt.textContent = r;
+    if ((i === 0 && !c.resolutions.includes(prev)) || r === prev) {
+      opt.selected = true;
+    } else if (i === 0) {
+      opt.selected = true;
+    }
+    res.appendChild(opt);
+  });
+}
+
+async function loadConfigStatus() {
+  try {
+    const res = await fetch(BASE + '/config');
+    if (!res.ok) return;
+    const cfg = await res.json();
+    // Build modelConstraints map
+    modelConstraints = {};
+    cfg.models.forEach(function(m) {
+      modelConstraints[m.name] = {
+        resolutions: m.resolutions,
+        duration_min: m.duration_min,
+        duration_max: m.duration_max,
+      };
+    });
+    // Update pill
+    const pill = $('key-pill');
+    const lbl = $('key-pill-label');
+    if (cfg.has_key) {
+      pill.classList.remove('missing');
+      pill.classList.add('ok');
+      const srcLabel = cfg.source === 'env' ? '（env 优先 · UI 改动不生效）'
+                    : cfg.source === 'local' ? '（local config.json）'
+                    : cfg.source === 'user'  ? '（用户配置）'
+                    : '';
+      lbl.textContent = 'API Key: ' + cfg.masked + ' ' + srcLabel;
+      pill.title = '来源: ' + cfg.source;
+    } else {
+      pill.classList.remove('ok');
+      pill.classList.add('missing');
+      lbl.textContent = 'API Key: 未配置 · 点击填写';
+    }
+    // Save path hint
+    const p = $('key-save-path');
+    if (p && cfg.user_config_path) p.textContent = cfg.user_config_path;
+
+    applyModelConstraints();
+  } catch(e) { /* ignore */ }
+}
+
+function openKeyDialog() {
+  $('key-input').value = '';
+  $('key-msg').textContent = '';
+  $('key-msg').className = '';
+  $('key-status-line').textContent = '请输入你的 MiniMax API Key';
+  $('key-dialog').showModal();
+  setTimeout(function() { $('key-input').focus(); }, 50);
+}
+
+function closeKeyDialog() {
+  $('key-dialog').close();
+}
+
+async function saveKey() {
+  const key = $('key-input').value.trim();
+  if (!key) { setKeyMsg('请输入 Key', true); return; }
+  const btn = $('key-save-btn');
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  try {
+    const res = await fetch(BASE + '/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: key }),
+    });
+    const data = await res.json();
+    if (!res.ok) { setKeyMsg('保存失败: ' + (data.detail || res.status), true); return; }
+    setKeyMsg('已保存到 ' + data.saved_to, false);
+    $('key-input').value = '';
+    await loadConfigStatus();
+    setTimeout(closeKeyDialog, 600);
+  } catch(e) {
+    setKeyMsg('网络错误: ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '保存';
+  }
+}
+
+function setKeyMsg(text, isErr) {
+  const el = $('key-msg');
+  el.textContent = text;
+  el.style.color = isErr ? '#c00' : '#060';
+}
+
+// Wire model select
+$('model').addEventListener('change', applyModelConstraints);
+
+loadConfigStatus();
 </script>
 </body>
 </html>

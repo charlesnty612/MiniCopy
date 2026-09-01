@@ -293,3 +293,108 @@ class TestPathHelpers:
     ) -> None:
         monkeypatch.chdir(tmp_path)
         assert _local_config_path() == tmp_path / "config.json"
+
+
+# --------------------------------------------------------------------------- mask_key
+class TestMaskKey:
+    def test_empty_returns_empty(self) -> None:
+        from minipic.config import mask_key
+        assert mask_key(None) == ""
+        assert mask_key("") == ""
+
+    def test_whitespace_returns_empty(self) -> None:
+        from minipic.config import mask_key
+        assert mask_key("   ") == ""
+
+    def test_short_key_returns_as_is(self) -> None:
+        from minipic.config import mask_key
+        assert mask_key("abcd") == "abcd"
+        assert mask_key("a") == "a"
+
+    def test_long_key_keeps_last_four(self) -> None:
+        from minipic.config import mask_key
+        assert mask_key("eyJhbGciOiJIUzI1NiJ9.abcdef123456hYmM") == "...hYmM"
+
+    def test_strips_whitespace_before_masking(self) -> None:
+        from minipic.config import mask_key
+        # Whitespace is stripped first; the surviving content is then masked
+        # by the same rules. "abcdef" is > 4 chars so we get "...XXXX".
+        assert mask_key("  abcdef  ") == "...cdef"
+
+
+# --------------------------------------------------------------------------- model registry + validate_model_params
+class TestModelRegistry:
+    def test_api_models_lists_both(self) -> None:
+        from minipic.config import API_MODELS
+        assert "MiniMax-H3" in API_MODELS
+        assert "MiniMax-H3-Max" in API_MODELS
+
+    def test_constraints_have_required_fields(self) -> None:
+        from minipic.config import MODEL_CONSTRAINTS
+        for name, c in MODEL_CONSTRAINTS.items():
+            assert "resolutions" in c and len(c["resolutions"]) > 0
+            assert "duration_min" in c and "duration_max" in c
+            assert c["duration_min"] <= c["duration_max"]
+
+    def test_h3_max_excludes_2k(self) -> None:
+        from minipic.config import MODEL_CONSTRAINTS
+        assert "2K" not in MODEL_CONSTRAINTS["MiniMax-H3-Max"]["resolutions"]
+        assert "2K" in MODEL_CONSTRAINTS["MiniMax-H3"]["resolutions"]
+
+    def test_h3_max_duration_min_is_5(self) -> None:
+        from minipic.config import MODEL_CONSTRAINTS
+        assert MODEL_CONSTRAINTS["MiniMax-H3-Max"]["duration_min"] == 5
+        assert MODEL_CONSTRAINTS["MiniMax-H3"]["duration_min"] == 4
+
+
+class TestValidateModelParams:
+    def test_unknown_model_raises(self) -> None:
+        from minipic.config import validate_model_params
+        with pytest.raises(_ConfigError, match="unsupported model"):
+            validate_model_params("MiniMax-X9")
+
+    def test_h3_accepts_768p_and_2k(self) -> None:
+        from minipic.config import validate_model_params
+        validate_model_params("MiniMax-H3", resolution="768P", duration=10)  # ok
+        validate_model_params("MiniMax-H3", resolution="2K", duration=4)     # ok
+
+    def test_h3_rejects_480p(self) -> None:
+        from minipic.config import validate_model_params
+        with pytest.raises(_ConfigError, match="480P"):
+            validate_model_params("MiniMax-H3", resolution="480P", duration=10)
+
+    def test_h3_rejects_duration_3(self) -> None:
+        from minipic.config import validate_model_params
+        with pytest.raises(_ConfigError, match="duration"):
+            validate_model_params("MiniMax-H3", resolution="768P", duration=3)
+
+    def test_h3_max_accepts_480p_and_768p(self) -> None:
+        from minipic.config import validate_model_params
+        validate_model_params("MiniMax-H3-Max", resolution="480P", duration=5)  # ok
+        validate_model_params("MiniMax-H3-Max", resolution="768P", duration=15)  # ok
+
+    def test_h3_max_rejects_2k(self) -> None:
+        from minipic.config import validate_model_params
+        with pytest.raises(_ConfigError, match="2K"):
+            validate_model_params("MiniMax-H3-Max", resolution="2K", duration=10)
+
+    def test_h3_max_rejects_duration_4(self) -> None:
+        from minipic.config import validate_model_params
+        with pytest.raises(_ConfigError, match="duration"):
+            validate_model_params("MiniMax-H3-Max", resolution="768P", duration=4)
+
+    def test_no_params_is_noop(self) -> None:
+        from minipic.config import validate_model_params
+        validate_model_params("MiniMax-H3")  # no resolution/duration → ok
+        validate_model_params("MiniMax-H3-Max")  # ok
+
+    def test_resolution_only(self) -> None:
+        from minipic.config import validate_model_params
+        # Resolution-only: H3 supports both 768P and 2K
+        validate_model_params("MiniMax-H3", resolution="768P")
+        validate_model_params("MiniMax-H3", resolution="2K")
+        # H3-Max + 2K is the real failure case
+        with pytest.raises(_ConfigError):
+            validate_model_params("MiniMax-H3-Max", resolution="2K")
+        # H3-Max + 480P is fine
+        validate_model_params("MiniMax-H3-Max", resolution="480P")

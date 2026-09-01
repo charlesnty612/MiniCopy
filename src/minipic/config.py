@@ -23,6 +23,68 @@ from .errors import ConfigError
 APP_NAME = "minipic"
 APP_AUTHOR = "minipic"
 
+# ---- model registry (kept in sync with MiniMax /v2/video_generation docs) ----
+
+API_MODELS: list[str] = ["MiniMax-H3", "MiniMax-H3-Max"]
+
+MODEL_CONSTRAINTS: dict[str, dict[str, Any]] = {
+    "MiniMax-H3": {
+        "resolutions": ["768P", "2K"],
+        "duration_min": 4,
+        "duration_max": 15,
+    },
+    "MiniMax-H3-Max": {
+        "resolutions": ["480P", "768P"],
+        "duration_min": 5,
+        "duration_max": 15,
+    },
+}
+
+
+def mask_key(key: Optional[str]) -> str:
+    """Return a UI-safe representation of an API key.
+
+    Returns "" for empty/None. For keys with 4 or fewer visible chars, returns
+    the key itself. Otherwise returns ``"...<last 4 chars>"``.
+    """
+    if not key:
+        return ""
+    s = key.strip()
+    if len(s) <= 4:
+        return s
+    return "..." + s[-4:]
+
+
+def validate_model_params(
+    model: str,
+    *,
+    resolution: Optional[str] = None,
+    duration: Optional[int] = None,
+) -> None:
+    """Raise ConfigError if model/resolution/duration is unsupported.
+
+    At least one of ``resolution`` / ``duration`` must be supplied; otherwise
+    this is a no-op. Empty / None for the optional parameter means "skip".
+    """
+    if model not in MODEL_CONSTRAINTS:
+        raise ConfigError(
+            f"unsupported model: {model!r} (supported: {', '.join(API_MODELS)})"
+        )
+    constraints = MODEL_CONSTRAINTS[model]
+    if resolution is not None and resolution != "":
+        if resolution not in constraints["resolutions"]:
+            raise ConfigError(
+                f"model {model!r} does not support resolution {resolution!r} "
+                f"(allowed: {', '.join(constraints['resolutions'])})"
+            )
+    if duration is not None:
+        lo = constraints["duration_min"]
+        hi = constraints["duration_max"]
+        if duration < lo or duration > hi:
+            raise ConfigError(
+                f"model {model!r} duration must be in [{lo}, {hi}], got {duration}"
+            )
+
 
 @dataclass
 class Config:

@@ -13,7 +13,15 @@ from typing import Annotated, Optional
 import click
 
 from . import web as _web_module
-from .config import Config, ensure_dirs, load_config, require_api_key, save_config
+from .config import (
+    API_MODELS,
+    Config,
+    ensure_dirs,
+    load_config,
+    require_api_key,
+    save_config,
+    validate_model_params,
+)
 from .client import MiniMaxClient
 from .errors import ConfigError, MiniPicError
 from .media import resolve_reference
@@ -190,6 +198,13 @@ def create_group() -> None:
     help="Output resolution. H3 V2 officially supports 768P (default) and 2K.",
 )
 @click.option(
+    "--model",
+    "model",
+    type=click.Choice(API_MODELS, case_sensitive=False),
+    default="MiniMax-H3",
+    help="Generation model. Default: MiniMax-H3.",
+)
+@click.option(
     "--wait/--no-wait",
     default=False,
     help="Block until the task finishes and download the result.",
@@ -199,6 +214,7 @@ def create_t2v(
     duration: Optional[int],
     ratio: str,
     resolution: str,
+    model: str,
     wait: bool,
 ) -> None:
     """Text-to-video: pure text prompt → video."""
@@ -214,12 +230,18 @@ def create_t2v(
 
     duration_val = duration if duration is not None else cfg.default_duration
 
+    try:
+        validate_model_params(model, resolution=resolution, duration=duration_val)
+    except ConfigError as e:
+        _print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
     content: list[dict] = [{"type": "text", "text": {"text": prompt}}]
 
     async def _run() -> None:
         async with MiniMaxClient(cfg) as client:
             task_id = await client.create_video_task(
-                model="MiniMax-H3",
+                model=model,
                 content=content,
                 duration=duration_val,
                 resolution=resolution,
@@ -264,6 +286,13 @@ def create_t2v(
     help="Output resolution. H3 V2 officially supports 768P (default) and 2K.",
 )
 @click.option(
+    "--model",
+    "model",
+    type=click.Choice(API_MODELS, case_sensitive=False),
+    default="MiniMax-H3",
+    help="Generation model. Default: MiniMax-H3.",
+)
+@click.option(
     "--wait/--no-wait",
     default=False,
     help="Block until the task finishes and download the result.",
@@ -274,6 +303,7 @@ def create_i2v(
     ref_image_role: str,
     duration: Optional[int],
     resolution: str,
+    model: str,
     wait: bool,
 ) -> None:
     """Image-to-video: first-frame image + text prompt → video."""
@@ -284,6 +314,12 @@ def create_i2v(
     init_db()
 
     duration_val = duration if duration is not None else cfg.default_duration
+
+    try:
+        validate_model_params(model, resolution=resolution, duration=duration_val)
+    except ConfigError as e:
+        _print(f"[red]{e}[/red]")
+        raise SystemExit(1)
 
     async def _run() -> None:
         async with MiniMaxClient(cfg) as client:
@@ -297,7 +333,7 @@ def create_i2v(
                 },
             ]
             task_id = await client.create_video_task(
-                model="MiniMax-H3",
+                model=model,
                 content=content,
                 duration=duration_val,
                 resolution=resolution,
@@ -363,6 +399,13 @@ def create_i2v(
     help="Output resolution. H3 V2 officially supports 768P (default) and 2K.",
 )
 @click.option(
+    "--model",
+    "model",
+    type=click.Choice(API_MODELS, case_sensitive=False),
+    default="MiniMax-H3",
+    help="Generation model. Default: MiniMax-H3.",
+)
+@click.option(
     "--wait/--no-wait",
     default=False,
     help="Block until the task finishes and download the result.",
@@ -376,6 +419,7 @@ def create_r2v(
     ratio: str,
     duration: Optional[int],
     resolution: str,
+    model: str,
     wait: bool,
 ) -> None:
     """Reference video generation: text + multimodal references → video."""
@@ -386,6 +430,12 @@ def create_r2v(
     init_db()
 
     duration_val = duration if duration is not None else cfg.default_duration
+
+    try:
+        validate_model_params(model, resolution=resolution, duration=duration_val)
+    except ConfigError as e:
+        _print(f"[red]{e}[/red]")
+        raise SystemExit(1)
 
     async def _run() -> None:
         from .media import prepare_reference_video
@@ -429,7 +479,7 @@ def create_r2v(
                 })
 
             task_id = await client.create_video_task(
-                model="MiniMax-H3",
+                model=model,
                 content=content,
                 duration=duration_val,
                 resolution=resolution,
@@ -641,15 +691,21 @@ def videos() -> None:
     help="Host to bind to. Use 0.0.0.0 to expose externally.",
 )
 def web(port: int, host: str) -> None:
-    """Start the local web UI (FastAPI + uvicorn)."""
+    """Start the local web UI (FastAPI + uvicorn).
+
+    No API key is required at startup — the user can configure it through
+    the UI's "API Key" button (POST /api/config) before submitting a task.
+    """
     import uvicorn
 
-    cfg = load_config()
-    require_api_key(cfg)
     ensure_dirs()
     init_db()
 
     _print(f"Starting web UI at http://{host}:{port}")
+    _print(
+        "Tip: configure your API key in the UI (top-right 'API Key' button) "
+        "if you haven't already."
+    )
     uvicorn.run(
         "minipic.web:app",
         host=host,

@@ -409,6 +409,27 @@ class TestCreateVideoTask:
                     duration=5,
                 )
 
+    @pytest.mark.asyncio
+    async def test_accepts_h3_max_model(self) -> None:
+        def handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content)
+            assert body["model"] == "MiniMax-H3-Max"
+            assert body["resolution"] == "768P"
+            return ok_response({"task_id": "tid-max"})
+
+        c = MiniMaxClient(Config(api_key="k"))
+        transport = httpx.MockTransport(handler)
+        async with c as client:
+            client._client = httpx.AsyncClient(base_url="https://x", transport=transport)
+            tid = await client.create_video_task(
+                model="MiniMax-H3-Max",
+                content=[{"type": "text", "text": "hi"}],
+                duration=6,
+                resolution="768P",
+                ratio="16:9",
+            )
+        assert tid == "tid-max"
+
 
 # --------------------------------------------------------------------------- query_video_task
 class TestQueryVideoTask:

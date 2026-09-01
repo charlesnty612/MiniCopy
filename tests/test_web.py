@@ -28,6 +28,7 @@ from minipic.errors import (
 from minipic.storage import TaskRecord
 from minipic.web import (
     CreateBody,
+    _detect_key_source,
     _record_to_dict,
     _submit_task,
     _validate_mode,
@@ -419,6 +420,7 @@ class TestCreateBody:
         assert b.duration == 10
         assert b.resolution == "768P"
         assert b.ratio == "16:9"
+        assert b.model == "MiniMax-H3"
         assert b.ref_images == []
         assert b.ref_videos == []
         assert b.ref_audios == []
@@ -437,6 +439,13 @@ class TestCreateBody:
     def test_resolution_pattern_enforced(self) -> None:
         with pytest.raises(Exception):
             CreateBody(mode="t2v", prompt="x", ratio="16:9", resolution="4K")
+
+    def test_model_pattern_enforced(self) -> None:
+        with pytest.raises(Exception):
+            CreateBody(mode="t2v", prompt="x", ratio="16:9", model="MiniMax-X9")
+        # Both real models accepted
+        CreateBody(mode="t2v", prompt="x", ratio="16:9", model="MiniMax-H3")
+        CreateBody(mode="t2v", prompt="x", ratio="16:9", model="MiniMax-H3-Max")
 
 
 # --------------------------------------------------------------------------- _validate_mode
@@ -633,3 +642,262 @@ class TestRecordToDict:
         assert d["output_path"] is None
         assert d["error"] is None
         assert d["extra"] == {}
+
+
+# --------------------------------------------------------------------------- GET /api/config + POST /api/config
+class TestApiConfigEndpoints:
+    def test_get_returns_masked_not_raw(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+        resp = web_client.get("/api/config")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["has_key"] is True
+        # sample_config fixture sets api_key="test-key-123" so mask is "...-123"
+        assert data["masked"] == "...-123"
+        # raw key must NOT be in the response
+        assert "api_key" not in data
+        # and the actual key prefix is also absent
+        assert "test-key" not in json.dumps(data)
+
+    def test_get_returns_model_constraints(self, web_client: TestClient) -> None:
+        resp = web_client.get("/api/config")
+        data = resp.json()
+        names = [m["name"] for m in data["models"]]
+        assert "MiniMax-H3" in names
+        assert "MiniMax-H3-Max" in names
+        # Spot-check constraints
+        h3 = next(m for m in data["models"] if m["name"] == "MiniMax-H3")
+        assert "768P" in h3["resolutions"]
+        assert "2K" in h3["resolutions"]
+        assert h3["duration_min"] == 4
+        max_m = next(m for m in data["models"] if m["name"] == "MiniMax-H3-Max")
+        assert "2K" not in max_m["resolutions"]
+        assert max_m["duration_min"] == 5
+
+    def test_get_handles_missing_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+        cfg = Config(api_key=None)
+        cfg.videos_dir = str(tmp_path / "videos")
+        app = create_app(cfg)
+        client = TestClient(app)
+        resp = client.get("/api/config")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["has_key"] is False
+        assert data["masked"] == ""
+        assert data["source"] == "none"
+
+    def test_post_persists_and_updates_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Redirect the user config path so we don't pollute the real one
+        target = tmp_path / "user_cfg" / "config.json"
+        import minipic.config as config_mod
+        monkeypatch.setattr(config_mod, "_user_config_path", lambda: target)
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+
+        cfg = Config(api_key="old-key")
+        cfg.videos_dir = str(tmp_path / "videos")
+        app = create_app(cfg)
+        client = TestClient(app)
+
+        resp = client.post("/api/config", json={"api_key": "new-key-1234"})
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["ok"] is True
+        # "new-key-1234" is 13 chars; last 4 are "1234"; mask is "...1234"
+        assert data["masked"] == "...1234"
+        # File should be on disk
+        assert target.is_file()
+        on_disk = json.loads(target.read_text(encoding="utf-8"))
+        assert on_disk["api_key"] == "new-key-1234"
+        # The in-memory cfg should also be updated
+        assert app.state.cfg.api_key == "new-key-1234"
+
+    def test_post_empty_key_rejected(self, web_client: TestClient) -> None:
+        resp = web_client.post("/api/config", json={"api_key": ""})
+        assert resp.status_code == 422  # pydantic min_length=1
+
+    def test_post_whitespace_key_rejected(self, web_client: TestClient) -> None:
+        resp = web_client.post("/api/config", json={"api_key": "   "})
+        assert resp.status_code == 400
+        assert "empty" in resp.json()["detail"].lower()
+
+    def test_post_then_create_uses_new_key(
+        self, web_client: TestClient, web_cfg: Config,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Replace api_key to a different value via POST, then submit a task
+        # and verify create still works (i.e. the new key took effect in memory).
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+        # Redirect user config so we don't write to real user dir
+        target = tmp_path / "u" / "config.json"
+        import minipic.config as config_mod
+        monkeypatch.setattr(config_mod, "_user_config_path", lambda: target)
+
+        from minipic import web as web_mod
+        class _Noop:
+            def __init__(self, c: Config) -> None:
+                self.c = c
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+            async def create_video_task(self, **kw): return "tid-after-rotate"
+            async def query_video_task(self, tid):
+                return {"status": "Processing"}
+            async def download_video(self, url, dest):
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"x")
+        monkeypatch.setattr(web_mod, "MiniMaxClient", _Noop)
+
+        resp = web_client.post("/api/config", json={"api_key": "rotated-1234abcd"})
+        assert resp.status_code == 200, resp.text
+
+        # Now submit a task with the (mocked) client
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "x", "ratio": "16:9", "resolution": "768P",
+        })
+        assert resp.status_code == 200, resp.text
+
+
+# --------------------------------------------------------------------------- _detect_key_source
+class TestDetectKeySource:
+    def test_env_when_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MINIMAX_API_KEY", "from-env")
+        assert _detect_key_source(Config(api_key="from-env")) == "env"
+
+    def test_user_when_user_file_has_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+        # Put the user config in a *sub* directory so it doesn't collide
+        # with the local config check (which looks at cwd/config.json).
+        user_path = tmp_path / "user_dir" / "config.json"
+        user_path.parent.mkdir(parents=True, exist_ok=True)
+        user_path.write_text(json.dumps({"api_key": "user-key"}), encoding="utf-8")
+        # Patch in BOTH namespaces: minipic.config (load_config) and
+        # minipic.web (where _detect_key_source is bound).
+        import minipic.config as config_mod
+        import minipic.web as web_mod
+        monkeypatch.setattr(config_mod, "_user_config_path", lambda: user_path)
+        monkeypatch.setattr(web_mod, "_user_config_path", lambda: user_path)
+        # chdir to a sibling empty dir so the local check is cleanly empty.
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+        assert _detect_key_source(Config(api_key="user-key")) == "user"
+
+    def test_local_when_cwd_config_has_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+        local = tmp_path / "config.json"
+        local.write_text(json.dumps({"api_key": "local-key"}), encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        assert _detect_key_source(Config(api_key="local-key")) == "local"
+
+    def test_local_wins_over_user(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+        local = tmp_path / "config.json"
+        local.write_text(json.dumps({"api_key": "local-key"}), encoding="utf-8")
+        user_path = tmp_path / "user" / "config.json"
+        user_path.parent.mkdir(parents=True, exist_ok=True)
+        user_path.write_text(json.dumps({"api_key": "user-key"}), encoding="utf-8")
+        import minipic.config as config_mod
+        monkeypatch.setattr(config_mod, "_user_config_path", lambda: user_path)
+        monkeypatch.chdir(tmp_path)
+        # cfg picks the local value (matches load_config priority)
+        assert _detect_key_source(Config(api_key="local-key")) == "local"
+
+    def test_none_when_no_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+        monkeypatch.chdir(tmp_path)
+        import minipic.config as config_mod
+        monkeypatch.setattr(
+            config_mod, "_user_config_path",
+            lambda: tmp_path / "nope.json",
+        )
+        assert _detect_key_source(Config()) == "none"
+
+
+# --------------------------------------------------------------------------- POST /api/create — model validation
+class TestApiCreateModelValidation:
+    def test_h3_max_rejects_2k(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "x", "ratio": "16:9",
+            "model": "MiniMax-H3-Max", "resolution": "2K",
+        })
+        assert resp.status_code == 400
+        assert "2K" in resp.json()["detail"]
+
+    def test_h3_max_rejects_duration_4(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "x", "ratio": "16:9",
+            "model": "MiniMax-H3-Max", "duration": 4,
+        })
+        assert resp.status_code == 400
+        assert "duration" in resp.json()["detail"].lower()
+
+    def test_h3_max_accepts_768p_duration_5(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        fake = fake_client_factory()
+        fake.create_video_task.return_value = "tid-max-ok"
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "x", "ratio": "16:9",
+            "model": "MiniMax-H3-Max", "resolution": "768P", "duration": 5,
+        })
+        assert resp.status_code == 200
+        # Verify the model was passed through
+        kwargs = fake.create_video_task.await_args.kwargs
+        assert kwargs["model"] == "MiniMax-H3-Max"
+        assert kwargs["resolution"] == "768P"
+        assert kwargs["duration"] == 5
+
+    def test_h3_default_model_passed(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        fake = fake_client_factory()
+        fake.create_video_task.return_value = "tid-default-model"
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "x", "ratio": "16:9", "resolution": "2K",
+        })
+        assert resp.status_code == 200
+        kwargs = fake.create_video_task.await_args.kwargs
+        assert kwargs["model"] == "MiniMax-H3"
+
+
+# --------------------------------------------------------------------------- _submit_task — model field passthrough
+class TestSubmitTaskModel:
+    @pytest.mark.asyncio
+    async def test_default_model_h3(self) -> None:
+        body = CreateBody(mode="t2v", prompt="x", ratio="16:9")
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-1")
+        await _submit_task(client, body)
+        assert client.create_video_task.await_args.kwargs["model"] == "MiniMax-H3"
+
+    @pytest.mark.asyncio
+    async def test_h3_max_explicit(self) -> None:
+        body = CreateBody(
+            mode="t2v", prompt="x", ratio="16:9",
+            model="MiniMax-H3-Max", resolution="768P", duration=5,
+        )
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-max")
+        await _submit_task(client, body)
+        kwargs = client.create_video_task.await_args.kwargs
+        assert kwargs["model"] == "MiniMax-H3-Max"
