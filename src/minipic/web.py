@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
-from fastapi import Body, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -426,6 +426,29 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             "saved_to": str(saved_to),
             "source": _detect_key_source(cfg),
         }
+
+    # -------------------------------------------------------- GET /api/probe/video (v0.1.5)
+    @app.get("/api/probe/video")
+    def api_probe_video(
+        path: Annotated[str, Query(min_length=1, description="Absolute path to a local video file.")],
+    ) -> dict[str, Any]:
+        """Probe a video file and return its duration in seconds.
+
+        Used by the UI to auto-fill the duration input after the user picks a
+        reference video via the file picker. The path is trusted to be a local
+        absolute path the user already has on disk; this endpoint does not
+        resolve remote URLs.
+
+        Raises 404 if the file is missing or ffprobe fails (e.g. corrupt).
+        """
+        p = Path(path)
+        if not p.is_file():
+            raise HTTPException(status_code=404, detail=f"file not found: {path}")
+        try:
+            seconds = ffprobe_duration(p)
+        except Exception as e:  # MediaError, JSON decode, etc.
+            raise HTTPException(status_code=400, detail=f"probe failed: {e}") from e
+        return {"duration": round(seconds, 2), "path": path}
 
     # -------------------------------------------------------- POST /api/upload (v0.1.4)
     @app.post("/api/upload")

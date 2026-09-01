@@ -573,6 +573,7 @@ async function uploadFile(fileInput) {
   const btn = fileInput.previousElementSibling;
   // text input is always the first <input type=text> sibling of the picker button
   const txtInput = fileInput.parentNode.querySelector('input[type=text]');
+  const isVideo = /^video\//.test(file.type);
   const origText = btn.textContent;
   btn.disabled = true; btn.textContent = '⏳';
   const fd = new FormData(); fd.append('file', file);
@@ -585,8 +586,31 @@ async function uploadFile(fileInput) {
     }
     const data = await r.json();
     if (txtInput) txtInput.value = data.path;
+    // For video uploads, auto-fill the duration input only if the user hasn't
+    // typed one yet. Probe via /api/probe/video (ffprobe under the hood).
+    if (isVideo) maybeAutofillDuration(data.path);
   } catch (e) { alert('上传失败: ' + e.message); }
   finally { btn.disabled = false; btn.textContent = origText; fileInput.value = ''; }
+}
+
+async function maybeAutofillDuration(path) {
+  const durInput = document.getElementById('duration');
+  if (!durInput) return;
+  // Only fill when the input is empty — never overwrite user input.
+  if (String(durInput.value).trim() !== '') return;
+  try {
+    const r = await fetch(BASE + '/probe/video?path=' + encodeURIComponent(path));
+    if (!r.ok) return;  // probe is best-effort; silently skip on failure.
+    const data = await r.json();
+    const seconds = Number(data.duration);
+    if (!Number.isFinite(seconds) || seconds <= 0) return;
+    // Clamp to model max (15s for H3) — single segments can't exceed that.
+    const capped = Math.min(15, Math.max(5, Math.round(seconds)));
+    durInput.value = String(capped);
+    if (seconds > 15.5) {
+      alert(`参考视频 ${seconds.toFixed(1)}s 已自动填入单段上限 15s；将走多段生成`);
+    }
+  } catch (_) { /* silent */ }
 }
 
 function pickFile(btn, accept) {

@@ -1476,6 +1476,47 @@ class TestApiUpload:
         assert resp.json()["content_type"] == "audio/mpeg"
 
 
+# ============================================================ v0.1.5 GET /api/probe/video
+class TestApiProbeVideo:
+    def test_probe_returns_duration(
+        self, web_client: TestClient, tmp_file, monkeypatch
+    ) -> None:
+        """Mocked ffprobe_duration: pass a path → get {duration, path} back."""
+        from minipic.web import MAX_UPLOAD_BYTES  # sanity check module loads
+        # Use a path that exists so is_file() passes.
+        p = tmp_file("fake.mp4", b"\x00" * 100)
+        monkeypatch.setattr("minipic.web.ffprobe_duration", lambda _p: 17.77)
+        r = web_client.get("/api/probe/video", params={"path": str(p)})
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["duration"] == 17.77
+        assert data["path"] == str(p)
+
+    def test_probe_404_for_missing_file(self, web_client: TestClient) -> None:
+        """A path that doesn't exist → 404 (no disk read attempted)."""
+        r = web_client.get("/api/probe/video", params={"path": "/no/such/file.mp4"})
+        assert r.status_code == 404, r.text
+        assert "not found" in r.json()["detail"].lower()
+
+    def test_probe_400_on_ffprobe_failure(
+        self, web_client: TestClient, tmp_file, monkeypatch
+    ) -> None:
+        """ffprobe raising MediaError → 400 with detail."""
+        from minipic.errors import MediaError
+        p = tmp_file("corrupt.mp4", b"\x00" * 100)
+        def _boom(_p: object) -> None:
+            raise MediaError("ffprobe failed: bogus stream")
+        monkeypatch.setattr("minipic.web.ffprobe_duration", _boom)
+        r = web_client.get("/api/probe/video", params={"path": str(p)})
+        assert r.status_code == 400, r.text
+        assert "probe failed" in r.json()["detail"].lower()
+
+    def test_probe_rejects_empty_path(self, web_client: TestClient) -> None:
+        """Empty path → 422 (FastAPI Query validation)."""
+        r = web_client.get("/api/probe/video", params={"path": ""})
+        assert r.status_code == 422, r.text
+
+
 # ============================================================ v0.1.3b _maybe_enhance_prompt
 class TestMaybeEnhancePrompt:
     @pytest.mark.asyncio
