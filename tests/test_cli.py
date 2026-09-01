@@ -837,3 +837,120 @@ def _strip_rich(s: str) -> str:
     """Strip ANSI escape codes from a rich-formatted string for JSON parsing."""
     import re
     return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
+# ============================================================ v0.1.3b prepare / commit
+class TestPrepareCommandRegistration:
+    def test_prepare_in_help(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(cli_mod.main, ["--help"])
+        assert result.exit_code == 0
+        assert "prepare" in result.output
+        assert "commit" in result.output
+        assert "prepares" in result.output
+
+    def test_prepare_subcommands_listed(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(cli_mod.main, ["prepare", "--help"])
+        assert result.exit_code == 0
+        assert "t2v" in result.output
+        assert "i2v" in result.output
+        assert "r2v" in result.output
+
+    def test_prepare_t2v_requires_api_key(self) -> None:
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            result = runner.invoke(cli_mod.main, [
+                "prepare", "t2v", "--prompt", "x", "--ratio", "16:9",
+            ])
+        # Should fail because no API key is set in the test env
+        assert result.exit_code != 0
+
+
+class TestPrepareHelpers:
+    def test_build_body_from_args_minimal(self) -> None:
+        body = cli_mod._build_body_from_args(
+            "t2v", "hello", (), (), (), None, "16:9", "768P", "MiniMax-H3", True,
+        )
+        assert body["mode"] == "t2v"
+        assert body["prompt"] == "hello"
+        assert body["use_context_ir"] is True
+        assert body["ref_images"] == []
+
+    def test_build_body_from_args_with_refs(self) -> None:
+        body = cli_mod._build_body_from_args(
+            "r2v", "x",
+            ("img.jpg",), ("vid.mp4:reference_video",), (),
+            10, "16:9", "768P", "MiniMax-H3", False,
+        )
+        assert body["ref_images"] == [{"path": "img.jpg", "role": "reference_image"}]
+        assert body["ref_videos"] == [{"path": "vid.mp4", "role": "reference_video"}]
+        assert body["use_context_ir"] is False
+
+    def test_save_plan_persists(self) -> None:
+        from minipic.storage import init_db, get_prepare, cleanup_expired_prepares
+        from minipic.config import user_data_path
+        init_db()
+        cleanup_expired_prepares()
+        body = {"mode": "t2v", "prompt": "x", "ratio": "16:9"}
+        plan = {"content": [], "segments": [], "warnings": []}
+        pid = cli_mod._save_plan(body, plan)
+        rec = get_prepare(pid)
+        assert rec is not None
+        assert rec.status == "prepared"
+        assert rec.payload == body
+
+    def test_print_prepare_plan_does_not_crash(self) -> None:
+        plan = {
+            "estimated_segments": 2,
+            "segments": [
+                {"index": 0, "start_seconds": 0.0, "duration_seconds": 7},
+                {"index": 1, "start_seconds": 7.0, "duration_seconds": 11},
+            ],
+            "warnings": [],
+            "content_preview": [
+                {"type": "text", "text": "rewritten prompt"},
+                {"type": "video_url", "url": "https://cdn/clip.mp4", "duration": 7},
+            ],
+            "used_context_ir": True,
+            "context_ir_fallback": False,
+            "enhanced_prompt": "rewritten 6-section prompt",
+        }
+        # Should not raise
+        cli_mod._print_prepare_plan(plan)
+
+    def test_print_prepare_plan_with_fallback_warning(self) -> None:
+        plan = {
+            "estimated_segments": 1,
+            "segments": [],
+            "warnings": ["Context-IR fallback"],
+            "content_preview": [],
+            "used_context_ir": False,
+            "context_ir_fallback": True,
+            "context_ir_error": "[2013] TokenPlan",
+        }
+        cli_mod._print_prepare_plan(plan)
+
+
+class TestCommitCommand:
+    def test_commit_nonexistent_returns_error(self) -> None:
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            result = runner.invoke(cli_mod.main, [
+                "commit", "prep-does-not-exist",
+            ])
+        # Should exit with error code
+        assert result.exit_code != 0
+
+
+class TestListPreparesCommand:
+    def test_list_prepares_empty(self) -> None:
+        from minipic.storage import init_db, cleanup_expired_prepares
+        init_db()
+        cleanup_expired_prepares()
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            result = runner.invoke(cli_mod.main, ["prepares"])
+        assert result.exit_code == 0
+        assert "No active prepares" in result.output
+

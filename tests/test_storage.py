@@ -11,12 +11,23 @@ import pytest
 
 from minipic.storage import (
     DB_FILENAME,
+    PREPARE_STATUS_COMMITTED,
+    PREPARE_STATUS_EXPIRED,
+    PREPARE_STATUS_PREPARED,
+    PREPARE_TTL_MS,
+    PrepareRecord,
     TaskRecord,
+    cleanup_expired_prepares,
     db_path,
+    delete_prepare,
+    get_prepare,
     get_task,
     init_db,
+    insert_prepare,
     insert_task,
+    list_prepares,
     list_tasks,
+    update_prepare_status,
     update_task,
 )
 
@@ -225,3 +236,184 @@ class TestGetTask:
     def test_returns_none_for_missing(self, storage_db: Path) -> None:
         init_db()
         assert get_task("nonexistent") is None
+
+
+# ============================================================ v0.1.3b prepare_records
+class TestPrepareRecordDefaults:
+    def test_status_starts_prepared(self) -> None:
+        r = PrepareRecord(prepare_id="prep-x", payload={"a": 1}, plan={"b": 2})
+        assert r.status == PREPARE_STATUS_PREPARED
+        assert r.task_id is None
+        assert r.extra == {}
+
+    def test_ttl_is_24h(self) -> None:
+        r = PrepareRecord(prepare_id="prep-y", payload={}, plan={})
+        delta = r.expires_at - r.created_at
+        assert abs(delta - PREPARE_TTL_MS) < 50  # allow clock skew
+
+
+class TestPrepareInsertAndGet:
+    def test_round_trip(self, storage_db: Path) -> None:
+        init_db()
+        rec = PrepareRecord(
+            prepare_id="prep-1",
+            payload={"mode": "r2v", "prompt": "a girl"},
+            plan={"content": [{"type": "text", "text": "x"}], "segments": []},
+        )
+        insert_prepare(rec)
+        fetched = get_prepare("prep-1")
+        assert fetched is not None
+        assert fetched.prepare_id == "prep-1"
+        assert fetched.payload == {"mode": "r2v", "prompt": "a girl"}
+        assert fetched.plan["content"][0]["text"] == "x"
+        assert fetched.status == PREPARE_STATUS_PREPARED
+
+    def test_missing_returns_none(self, storage_db: Path) -> None:
+        init_db()
+        assert get_prepare("does-not-exist") is None
+
+    def test_insert_twice_replaces(self, storage_db: Path) -> None:
+        init_db()
+        r1 = PrepareRecord(prepare_id="prep-twice", payload={"v": 1}, plan={})
+        r2 = PrepareRecord(
+            prepare_id="prep-twice", payload={"v": 2}, plan={},
+            status=PREPARE_STATUS_COMMITTED, task_id="task-99",
+        )
+        insert_prepare(r1)
+        insert_prepare(r2)
+        fetched = get_prepare("prep-twice")
+        assert fetched is not None
+        assert fetched.payload == {"v": 2}
+        assert fetched.status == PREPARE_STATUS_COMMITTED
+        assert fetched.task_id == "task-99"
+
+
+class TestPrepareUpdateStatus:
+    def test_mark_committed(self, storage_db: Path) -> None:
+        init_db()
+        insert_prepare(PrepareRecord(prepare_id="prep-c", payload={}, plan={}))
+        update_prepare_status("prep-c", PREPARE_STATUS_COMMITTED, task_id="task-1")
+        fetched = get_prepare("prep-c")
+        assert fetched is not None
+        assert fetched.status == PREPARE_STATUS_COMMITTED
+        assert fetched.task_id == "task-1"
+
+    def test_status_only(self, storage_db: Path) -> None:
+        init_db()
+        insert_prepare(PrepareRecord(prepare_id="prep-s", payload={}, plan={}))
+        update_prepare_status("prep-s", PREPARE_STATUS_EXPIRED)
+        fetched = get_prepare("prep-s")
+        assert fetched is not None
+        assert fetched.status == PREPARE_STATUS_EXPIRED
+        assert fetched.task_id is None
+
+
+class TestPrepareList:
+    def test_orders_newest_first(self, storage_db: Path) -> None:
+        init_db()
+        base = int(time.time() * 1000)
+        for i in range(3):
+            insert_prepare(PrepareRecord(
+                prepare_id=f"prep-{i}", payload={}, plan={},
+                created_at=base + i * 1000,
+            ))
+        rows = list_prepares()
+        assert [r.prepare_id for r in rows] == ["prep-2", "prep-1", "prep-0"]
+
+    def test_filter_by_status(self, storage_db: Path) -> None:
+        init_db()
+        insert_prepare(PrepareRecord(
+            prepare_id="prep-a", payload={}, plan={}, status=PREPARE_STATUS_PREPARED,
+        ))
+        insert_prepare(PrepareRecord(
+            prepare_id="prep-b", payload={}, plan={}, status=PREPARE_STATUS_COMMITTED,
+        ))
+        rows = list_prepares(status=PREPARE_STATUS_COMMITTED)
+        assert [r.prepare_id for r in rows] == ["prep-b"]
+
+    def test_excludes_expired_by_default(self, storage_db: Path) -> None:
+        init_db()
+        insert_prepare(PrepareRecord(
+            prepare_id="prep-old", payload={}, plan={},
+            status=PREPARE_STATUS_PREPARED, expires_at=10,   # 10ms epoch
+        ))
+        insert_prepare(PrepareRecord(
+            prepare_id="prep-fresh", payload={}, plan={},
+        ))
+        rows = list_prepares(include_expired=False)
+        ids = [r.prepare_id for r in rows]
+        assert "prep-fresh" in ids
+        assert "prep-old" not in ids
+
+    def test_include_expired(self, storage_db: Path) -> None:
+        init_db()
+        insert_prepare(PrepareRecord(
+            prepare_id="prep-old2", payload={}, plan={}, expires_at=10,
+        ))
+        rows = list_prepares(include_expired=True)
+        assert any(r.prepare_id == "prep-old2" for r in rows)
+
+
+class TestPrepareDelete:
+    def test_delete_existing(self, storage_db: Path) -> None:
+        init_db()
+        insert_prepare(PrepareRecord(prepare_id="prep-d", payload={}, plan={}))
+        assert get_prepare("prep-d") is not None
+        delete_prepare("prep-d")
+        assert get_prepare("prep-d") is None
+
+    def test_delete_missing_is_no_op(self, storage_db: Path) -> None:
+        init_db()
+        delete_prepare("never-existed")  # must not raise
+
+
+class TestPrepareCleanup:
+    def test_marks_only_expired_prepared(self, storage_db: Path) -> None:
+        init_db()
+        now = int(time.time() * 1000)
+        # Stale prepared (expired)
+        insert_prepare(PrepareRecord(
+            prepare_id="prep-stale", payload={}, plan={},
+            created_at=now - 100_000, expires_at=now - 50_000,
+        ))
+        # Fresh prepared (not expired)
+        insert_prepare(PrepareRecord(
+            prepare_id="prep-fresh", payload={}, plan={},
+            created_at=now, expires_at=now + 50_000,
+        ))
+        # Already committed (not affected)
+        insert_prepare(PrepareRecord(
+            prepare_id="prep-committed", payload={}, plan={},
+            created_at=now - 100_000, expires_at=now - 50_000,
+            status=PREPARE_STATUS_COMMITTED,
+        ))
+        n = cleanup_expired_prepares(now_ms=now)
+        assert n == 1
+        stale = get_prepare("prep-stale")
+        assert stale is not None and stale.status == PREPARE_STATUS_EXPIRED
+        fresh = get_prepare("prep-fresh")
+        assert fresh is not None and fresh.status == PREPARE_STATUS_PREPARED
+        committed = get_prepare("prep-committed")
+        assert committed is not None and committed.status == PREPARE_STATUS_COMMITTED
+
+    def test_returns_zero_when_nothing_to_clean(self, storage_db: Path) -> None:
+        init_db()
+        insert_prepare(PrepareRecord(prepare_id="prep-keep", payload={}, plan={}))
+        n = cleanup_expired_prepares()
+        assert n == 0
+
+
+class TestPrepareInitDbIdempotent:
+    def test_two_init_runs_dont_raise(self, storage_db: Path) -> None:
+        init_db()
+        init_db()
+        conn = sqlite3.connect(str(storage_db))
+        try:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name='prepare_records'"
+            ).fetchone()[0]
+            assert n == 1
+        finally:
+            conn.close()
+

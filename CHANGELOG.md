@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.1.3b] - 2026-09-01
+
+### Added
+- **多段生成（multi-segment generation）**。当上传的参考视频 > 15s（H3 单段上限）时，minipic 自动：
+  1. 用 ffmpeg `gt(scene,THR)` 做镜头边界检测，**adaptive threshold**（0.4 → 0.3 → 0.5 三档降级，无可用切点时退到均匀切）
+  2. 调 `plan_segments()` 在 `±3s` 窗口内挑最近镜头切点，确定每段时长（**整数秒**，每段 4-15s）
+  3. ffmpeg 物理切文件（`-ss` fast seek + libx264/aac 重编码）到 `%APPDATA%/minipic/clips/<source.stem>/`
+  4. **每个切段**独立上传 + 独立调一次 H3 generation
+  5. 完成后用 ffmpeg concat demuxer 拼成最终视频
+  6. 中间产物 `_segNN.mp4` 在父 task 进入 succeeded 后自动清理
+- **段数硬上限 N ≤ 4**。超过 60s 的参考视频直接 `MediaError("would need 5 segments (max 4)")`，提示用户裁剪。
+- **父 task + N 子 task 模型**。1 个 `mode=multi` 父 task + N 个 `mode=r2v` 子 task（`extra.parent_task_id` 关联）。`GET /api/tasks/{parent_id}` 返回时 `children` 数组嵌入每个子 task 状态。父 task status: `submitted` / `processing` / `succeeded` / `partial` / `failed`。
+- **用户确认流：`/api/prepare` → `/api/commit/{id}`**。一站式 `/api/create` 拆成两阶段：
+  - `POST /api/prepare`：上传参考 + 切点 + Content-IR + build content 草稿，**不调 H3**（零成本），返回 `prepare_id` + 完整 plan（切点表、CDN URL、warnings、enhanced_prompt）
+  - `GET /api/prepare/{id}`：重新查看 plan
+  - `POST /api/commit/{id}`：用户确认后才调 H3（**不可中断**），后台 asyncio task 跑 polling + 拼接
+  - 24h 过期（`PREPARE_TTL_MS`），过期返回 410 Gone
+  - 重复 commit 同 prepare_id 返回 410 already-committed
+- **CLI `minipic prepare {t2v,i2v,r2v}` + `minipic commit <prepare_id>` + `minipic prepares`**。`--yes` 一步提交（跳过 review 面板）。
+- **UI prepare 流**（默认走两步流程）。新建"准备计划"折叠面板：切点表 / CDN URL 列表 / warnings（黄色 badge）/ Context-IR 状态 / `[取消] [确认提交]` 按钮。`高级` 折叠里加"Context-IR 改写 prompt"（默认勾选）和"一步提交（跳过准备预览）"开关。
+- **Context-IR 默认 ON + 自动降级**。`PrepareBody.use_context_ir: bool = True`。失败（如 TokenPlan 2013）自动用原 prompt + warning，**不卡住用户**。UI 顶部右侧 `Context-IR: ✓ 已改写` / `Context-IR: ⚠ 降级到原 prompt` 状态药丸。
+- **响应字段**：`enhanced_prompt`（实际送 H3 的）/ `original_prompt`（用户原输入）/ `used_context_ir` / `context_ir_fallback` / `context_ir_error` / `context_ir_warning`。
+- **真实视频 probe 验证**：基于用户提供的 17.77s Woody 包快剪视频，方案 A（reference 模式切分）完胜方案 D（first_frame 串行）。方案 D 留 v0.1.4+。
+
+### Deprecated
+- `POST /api/create` 加 FastAPI `deprecated=True` 标记。**行为不变**（内部走 prepare + commit 合并），CLI 仍可正常用。v0.2.0 才删。
+
+### Changed
+- `MiniMaxClient` 不动；Context-IR 已存在，minipic v0.1.0 就在用，v0.1.3b 把集成从"可选 CLI 工具"提升为"prepare 阶段默认 step + 自动降级"。
+- `MediaError` 不动；多段相关的常量挪到 `media.py` 顶部（`SEGMENT_MIN_SECONDS=4` / `SEGMENT_MAX_SECONDS=15` / `SEGMENT_MAX_COUNT=4` / `SEGMENT_BOUNDARY_WINDOW=3.0`）。
+
+### Non-goals（v0.1.3b 不做）
+- **方案 D**（first_frame 串行锁住）—— 快剪视频不需要，留 v0.1.4+
+- **拼接质量优化**（crossfade / 转场）—— 留 v0.1.4
+- **PySceneDetect 依赖**—— 手写 ffmpeg scene detection，~30 行
+- **自动重试**（H3 失败重试整批）—— v0.1.3b 只手动重试（重新 prepare）
+- **commit 中止**—— H3 没看到 cancel API
+
+### Verification
+- 422 单元/集成测试通过（原 337 + 18 storage + 27 media + 30 web + 10 cli = 422；实跑 422 pass / 0 fail）
+- Web 端到端 smoke：`POST /api/prepare` (t2v) → `GET /api/prepare/{id}` → `POST /api/commit/{id}` 跑通，Context-IR 改写路径走通
+- CLI `minipic prepare t2v --prompt ... --ratio 16:9` 注册到 `--help`
+- **真实 E2E 视频生成要换 pay-as-you-go key**（当前 TokenPlan key 不支持 Context-IR，v0.1.3b 的降级路径已用 mock 验证）
+
 ## [0.1.2] - 2026-09-01
 
 ### Added

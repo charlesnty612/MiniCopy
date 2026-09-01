@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -31,6 +32,13 @@ REF_VIDEO_MAX_CLIPS = 3
 REF_VIDEO_TOTAL_BUDGET = 15.0       # sum of durations in seconds
 REF_VIDEO_CLIP_LEN_AUTO = 5.0       # default sample length when auto-sampling
 
+# v0.1.3b multi-segment planning limits
+SEGMENT_MIN_SECONDS = 4             # H3 min (per single generation call)
+SEGMENT_MAX_SECONDS = 15            # H3 max (per single generation call)
+SEGMENT_MAX_COUNT = 4               # cap the number of segments per multi-segment task
+SEGMENT_BOUNDARY_WINDOW = 3.0       # ±3s window when snapping to a shot boundary
+SEGMENT_SCENE_THRESHOLDS = (0.4, 0.3, 0.5)  # adaptive ffmpeg scene detection thresholds
+
 
 @dataclass
 class VideoClip:
@@ -41,6 +49,26 @@ class VideoClip:
 
     def label(self) -> str:
         return f"{self.start_seconds:.2f}s+{self.duration_seconds:.2f}s"
+
+
+@dataclass
+class SegmentSpec:
+    """A planned cut for multi-segment generation (v0.1.3b).
+
+    Distinct from VideoClip: SegmentSpec is the *plan* (start + integer duration
+    that the segment should produce). VideoClip is the *executed* split file
+    on disk. The two are produced by different code paths in v0.1.3b
+    (`plan_segments` vs `prepare_reference_video`).
+    """
+
+    start_seconds: float
+    duration_seconds: int
+
+    def end_seconds(self) -> float:
+        return self.start_seconds + float(self.duration_seconds)
+
+    def label(self) -> str:
+        return f"{self.start_seconds:.2f}s–{self.end_seconds():.2f}s ({self.duration_seconds}s)"
 
 
 # ----------------------------------------------------------- ffmpeg discovery
@@ -255,3 +283,226 @@ async def prepare_reference_video(
             duration_seconds=clip.duration_seconds, is_split=True,
         ))
     return extracted
+
+
+# =========================================================== v0.1.3b multi-segment
+
+def find_shot_boundaries(
+    video_path: Path,
+    *,
+    thresholds: tuple[float, ...] = SEGMENT_SCENE_THRESHOLDS,
+    min_count: int = 3,
+    max_count: int = 20,
+) -> list[float]:
+    """Detect shot boundaries in a video using ffmpeg's scene filter.
+
+    Tries each ``threshold`` in order; returns the first list whose length falls
+    inside ``[min_count, max_count]``. Falls back to an empty list when no
+    threshold produces a usable result (caller is expected to evenly split).
+
+    Implementation notes
+    --------------------
+    * Uses ``select='gt(scene,THR)',showinfo`` so we can read the pts_time of
+      each detected frame transition from ffmpeg's log output.
+    * This is intentionally hand-rolled (~30 lines) so we do not pull in
+      PySceneDetect as a dependency.
+    """
+    if not video_path.is_file():
+        raise MediaError(f"video not found: {video_path}")
+    ffmpeg = find_ffmpeg()
+    for threshold in thresholds:
+        try:
+            proc = subprocess.run(
+                [
+                    ffmpeg,
+                    "-i", str(video_path),
+                    "-filter:v", f"select='gt(scene,{threshold})',showinfo",
+                    "-f", "null", "-",
+                ],
+                capture_output=True, text=True, timeout=60,
+                encoding="utf-8",
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.warning("ffmpeg scene detect failed at threshold=%s: %s", threshold, e)
+            continue
+        # ffmpeg prints "pts_time:NNN" on the showinfo line for every selected frame.
+        boundaries: list[float] = []
+        for line in proc.stderr.splitlines():
+            idx = line.find("pts_time:")
+            if idx < 0:
+                continue
+            tail = line[idx + len("pts_time:"):].strip()
+            head = tail.split()[0] if tail else ""
+            try:
+                boundaries.append(float(head))
+            except ValueError:
+                continue
+        if min_count <= len(boundaries) <= max_count:
+            log.info(
+                "scene detect: threshold=%s found %d boundaries in %s",
+                threshold, len(boundaries), video_path.name,
+            )
+            return sorted(boundaries)
+        log.debug(
+            "scene detect: threshold=%s produced %d boundaries (target %d..%d), retrying",
+            threshold, len(boundaries), min_count, max_count,
+        )
+    log.warning("scene detect: all thresholds failed; will fall back to even split")
+    return []
+
+
+def plan_segments(
+    ref_duration: float,
+    boundaries: list[float],
+    *,
+    max_segment_duration: int = SEGMENT_MAX_SECONDS,
+    min_segment_duration: int = SEGMENT_MIN_SECONDS,
+    max_segments: int = SEGMENT_MAX_COUNT,
+    boundary_window: float = SEGMENT_BOUNDARY_WINDOW,
+) -> list[SegmentSpec]:
+    """Plan how to split a reference video into multiple H3 generations.
+
+    Each generated segment must be an *integer* number of seconds (H3 only
+    accepts integer durations). The total of all segments may exceed the
+    reference duration slightly (H3 clips always end at the next second).
+
+    Raises
+    ------
+    MediaError
+        When the reference would require more than ``max_segments`` segments.
+    """
+    if ref_duration <= 0:
+        raise MediaError("ref_duration must be > 0")
+    n_segments = max(1, math.ceil(ref_duration / max_segment_duration))
+    if n_segments > max_segments:
+        raise MediaError(
+            f"reference video is {ref_duration:.1f}s, would need {n_segments} segments "
+            f"(max {max_segments}). Trim the video to \u2264{max_segments * max_segment_duration}s, "
+            f"or split into multiple minipic calls."
+        )
+
+    # Short video that fits in one segment: return a single segment, no snapping.
+    if ref_duration <= max_segment_duration + 0.05:
+        return [SegmentSpec(
+            start_seconds=0.0,
+            duration_seconds=int(math.ceil(ref_duration)),
+        )]
+
+    target_per_seg = round(ref_duration / n_segments)
+    segments: list[SegmentSpec] = []
+    cursor = 0.0
+    for i in range(n_segments):
+        if i == n_segments - 1:
+            # Final segment: extends to the end of the reference (rounded up to integer).
+            duration = int(math.ceil(ref_duration - cursor))
+        else:
+            ideal = cursor + target_per_seg
+            candidates = [
+                b for b in boundaries
+                if abs(b - ideal) <= boundary_window
+                and b > cursor + 0.5
+                and b < ref_duration - 1.0
+            ]
+            if candidates:
+                cut_at = min(candidates, key=lambda b: abs(b - ideal))
+            else:
+                # No usable shot boundary near the ideal point — fall back to even split.
+                cut_at = ideal
+            duration = int(round(cut_at - cursor))
+            duration = max(min_segment_duration, min(max_segment_duration, duration))
+        segments.append(SegmentSpec(start_seconds=cursor, duration_seconds=duration))
+        cursor += duration
+    return segments
+
+
+async def extract_reference_clips(
+    source: Path,
+    segments: list[SegmentSpec],
+) -> list[Path]:
+    """Cut ``source`` into one .mp4 per SegmentSpec. Caches by (stem, start, dur).
+
+    Cache layout
+    ------------
+    ``%APPDATA%/minipic/clips/<source.stem>/clip_NN_tSSSS_dDDDD.mp4``
+
+    Re-running the same plan with the same source skips re-encoding for any
+    clip whose output file already exists. This means commit can be retried
+    cheaply after a failed H3 submission.
+    """
+    if not source.is_file():
+        raise MediaError(f"video not found: {source}")
+    if not segments:
+        raise MediaError("extract_reference_clips: segments is empty")
+    ffmpeg = find_ffmpeg()
+    cache_dir = user_data_path("clips") / source.stem
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    extracted: list[Path] = []
+    for i, seg in enumerate(segments):
+        out = cache_dir / (
+            f"clip_{i:02d}_t{int(seg.start_seconds):04d}_d{int(seg.duration_seconds):04d}.mp4"
+        )
+        if not out.is_file():
+            cmd = [
+                ffmpeg, "-y", "-loglevel", "error",
+                "-ss", f"{seg.start_seconds:.3f}",
+                "-i", str(source),
+                "-t", f"{seg.duration_seconds:.3f}",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                str(out),
+            ]
+            log.debug("ffmpeg extract segment %d: %s", i, " ".join(cmd))
+            try:
+                await asyncio.to_thread(subprocess.run, cmd, check=True, timeout=120)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                raise MediaError(
+                    f"ffmpeg extract failed for segment {i} ({seg.label()}): {e}"
+                ) from e
+        extracted.append(out)
+    return extracted
+
+
+def concat_videos(clip_paths: list[Path], out_path: Path) -> Path:
+    """Concatenate ``clip_paths`` into ``out_path`` using the ffmpeg concat demuxer.
+
+    Single-clip fast path: just copies the file. Hard-cut (no crossfade) — v0.1.3b
+    keeps it simple. ``out_path`` parent dirs are created as needed.
+    """
+    if not clip_paths:
+        raise MediaError("concat_videos: clip_paths is empty")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if len(clip_paths) == 1:
+        shutil.copy2(clip_paths[0], out_path)
+        return out_path
+    ffmpeg = find_ffmpeg()
+    list_file = out_path.with_suffix(out_path.suffix + ".concat.txt")
+    try:
+        list_file.write_text(
+            "\n".join(f"file '{_concat_escape(p.resolve())}'" for p in clip_paths),
+            encoding="utf-8",
+        )
+        cmd = [
+            ffmpeg, "-y", "-loglevel", "error",
+            "-f", "concat", "-safe", "0", "-i", str(list_file),
+            "-c", "copy",
+            str(out_path),
+        ]
+        log.debug("ffmpeg concat: %s", " ".join(cmd))
+        subprocess.run(cmd, check=True, timeout=120)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        raise MediaError(f"ffmpeg concat failed: {e}") from e
+    finally:
+        list_file.unlink(missing_ok=True)
+    return out_path
+
+
+def _concat_escape(p: Path) -> str:
+    """Escape a path for ffmpeg concat demuxer's ``file '...'`` directive.
+
+    On Windows paths may contain a colon (e.g. ``C:\...``) which the demuxer
+    treats as an option prefix. We also escape single quotes.
+    """
+    s = str(p)
+    return s.replace("'", "'\\''")
+

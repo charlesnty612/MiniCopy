@@ -86,6 +86,32 @@ dialog .key-msg { font-size: 0.85rem; min-height: 1.2em; margin: 10px 0 0; }
 dialog .key-msg.err { color: #c00; }
 dialog .key-msg.ok { color: #060; }
 dialog .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+/* v0.1.3b prepare/commit flow */
+.ir-status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
+.ir-status.rewritten { background: #e8f5e8; color: #060; }
+.ir-status.fallback { background: #fff5e0; color: #a60; }
+.ir-status.disabled { background: #eee; color: #666; }
+
+details.advanced { margin-top: 12px; }
+details.advanced summary { cursor: pointer; font-size: 0.85rem; color: #555; padding: 4px 0; }
+details.advanced[open] summary { margin-bottom: 8px; }
+
+#plan-panel { display: none; margin-top: 14px; padding: 12px; background: #fafafa; border: 1px solid #e0e0e0; border-radius: 4px; }
+#plan-panel h4 { font-size: 0.95rem; margin-bottom: 8px; }
+.plan-section { margin: 8px 0; }
+.plan-section-title { font-size: 0.8rem; font-weight: 600; color: #555; margin-bottom: 4px; }
+.plan-warn { background: #fff8e1; border-left: 3px solid #f0a020; padding: 6px 10px; margin: 6px 0; font-size: 0.83rem; border-radius: 2px; }
+.plan-segment { padding: 4px 0; font-size: 0.85rem; font-family: monospace; }
+.plan-content-item { padding: 2px 0; font-size: 0.8rem; color: #444; word-break: break-all; }
+.plan-content-item .kind { display: inline-block; min-width: 70px; color: #888; }
+.plan-prompt-box { background: #fff; border: 1px solid #ddd; padding: 6px 8px; border-radius: 3px; font-family: monospace; font-size: 0.8rem; white-space: pre-wrap; max-height: 200px; overflow-y: auto; word-break: break-all; }
+.plan-prompt-toggle { font-size: 0.78rem; color: #06c; cursor: pointer; user-select: none; }
+.plan-prompt-toggle:hover { text-decoration: underline; }
+#plan-actions { display: flex; gap: 8px; margin-top: 12px; }
+
+#submit-row { display: flex; gap: 8px; align-items: center; margin-top: 14px; }
+#submit-row .btn-primary { margin-right: 4px; }
 </style>
 </head>
 <body>
@@ -187,9 +213,40 @@ dialog .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top
     <span>等待结果（阻塞请求直到视频生成完成，可能需要 15-30 分钟）</span>
   </label>
 
-  <div style="margin-top:14px; display:flex;gap:8px;align-items:center">
-    <button class="btn btn-primary" onclick="submitTask()">提交任务</button>
+  <div id="submit-row">
+    <button class="btn btn-primary" id="submit-btn" onclick="onSubmitClick()">准备 + 提交</button>
     <span id="msg"></span>
+    <span id="ir-pill" class="ir-status disabled" style="margin-left:auto" title="Context-IR prompt rewrite">Context-IR: 默认开</span>
+  </div>
+
+  <details class="advanced">
+    <summary>高级</summary>
+    <label class="checkbox-label">
+      <input type="checkbox" id="use-context-ir" checked>
+      <span>使用 Context-IR 改写提示词（推荐）</span>
+    </label>
+    <label class="checkbox-label">
+      <input type="checkbox" id="skip-confirm">
+      <span>一步提交（跳过准备预览，直接调 H3）</span>
+    </label>
+  </details>
+
+  <div id="plan-panel">
+    <h4>准备计划 <span id="plan-prepare-id" class="task-id"></span></h4>
+    <div id="plan-ir-status" class="plan-section"></div>
+    <div id="plan-warnings" class="plan-section"></div>
+    <div id="plan-segments" class="plan-section"></div>
+    <div id="plan-content" class="plan-section"></div>
+    <div id="plan-prompt-section" class="plan-section">
+      <div class="plan-section-title">
+        <span class="plan-prompt-toggle" id="plan-prompt-toggle">显示原 prompt ▾</span>
+      </div>
+      <div class="plan-prompt-box" id="plan-prompt-box" style="display:none"></div>
+    </div>
+    <div id="plan-actions">
+      <button class="btn" onclick="cancelPlan()">取消</button>
+      <button class="btn btn-primary" id="plan-commit-btn" onclick="commitPlan()">确认提交</button>
+    </div>
   </div>
 </div>
 
@@ -310,10 +367,173 @@ function setMsg(text, isErr) {
   el.className = isErr ? 'err' : 'ok';
 }
 
-async function submitTask() {
+// ============================================================ v0.1.3b prepare / commit
+let currentPrepare = null;       // last /api/prepare response
+let currentPreparePayload = null; // payload that was sent (for re-display)
+
+function applyContextIrPill(usedIr, fallback) {
+  const el = $('ir-pill');
+  el.classList.remove('rewritten', 'fallback', 'disabled');
+  if (usedIr) {
+    el.classList.add('rewritten');
+    el.textContent = 'Context-IR: ✓ 已改写';
+  } else if (fallback) {
+    el.classList.add('fallback');
+    el.textContent = 'Context-IR: ⚠ 降级到原 prompt';
+  } else {
+    el.classList.add('disabled');
+    el.textContent = 'Context-IR: 未使用';
+  }
+}
+
+function renderPlan(plan) {
+  $('plan-prepare-id').textContent = plan.prepare_id || '';
+  applyContextIrPill(plan.used_context_ir, plan.context_ir_fallback);
+
+  // Warnings
+  const warns = $('plan-warnings');
+  warns.innerHTML = '';
+  (plan.warnings || []).forEach(function(w) {
+    const div = document.createElement('div');
+    div.className = 'plan-warn';
+    div.textContent = '⚠ ' + w;
+    warns.appendChild(div);
+  });
+
+  // Segments
+  const segs = $('plan-segments');
+  segs.innerHTML = '';
+  if (plan.segments && plan.segments.length > 0) {
+    const title = document.createElement('div');
+    title.className = 'plan-section-title';
+    title.textContent = '切点表（' + plan.estimated_segments + ' 段）';
+    segs.appendChild(title);
+    plan.segments.forEach(function(s) {
+      const div = document.createElement('div');
+      div.className = 'plan-segment';
+      div.textContent =
+        '段 ' + s.index + ': ' + s.start_seconds.toFixed(2) + 's + ' +
+        s.duration_seconds + 's → ' + (s.ref_clip_path || '');
+      segs.appendChild(div);
+    });
+  }
+
+  // Content
+  const content = $('plan-content');
+  content.innerHTML = '';
+  const contentTitle = document.createElement('div');
+  contentTitle.className = 'plan-section-title';
+  contentTitle.textContent = 'Content[]（送 H3 的内容）';
+  content.appendChild(contentTitle);
+  (plan.content_preview || []).forEach(function(item, i) {
+    const div = document.createElement('div');
+    div.className = 'plan-content-item';
+    const kind = item.type || '?';
+    let val = '';
+    if (kind === 'text') {
+      val = (item.text || '').slice(0, 120) +
+        ((item.text || '').length > 120 ? '…' : '');
+    } else if (kind === 'video_url' || kind === 'image_url' || kind === 'audio_url') {
+      val = (item.url || '').slice(0, 100);
+    } else {
+      val = JSON.stringify(item).slice(0, 100);
+    }
+    div.innerHTML = '<span class="kind">[' + i + '] ' + kind + '</span>' + escHtml(val);
+    content.appendChild(div);
+  });
+
+  // Prompt (collapsible — default show the enhanced one if used, original otherwise)
+  const promptBox = $('plan-prompt-box');
+  const promptToggle = $('plan-prompt-toggle');
+  promptBox.textContent = plan.used_context_ir
+    ? (plan.enhanced_prompt || '')
+    : (plan.original_prompt || plan.enhanced_prompt || '');
+  promptToggle.textContent = '显示 ' +
+    (plan.used_context_ir ? 'Context-IR 改写' : '原 prompt') + ' ▾';
+
+  $('plan-panel').style.display = 'block';
+}
+
+function hidePlan() {
+  $('plan-panel').style.display = 'none';
+  currentPrepare = null;
+  currentPreparePayload = null;
+}
+
+async function onSubmitClick() {
+  if ($('skip-confirm').checked) {
+    return submitTaskLegacy();
+  }
+  return prepareTask();
+}
+
+async function prepareTask() {
   setMsg('', false);
   const payload = buildPayload();
   if (!payload.prompt) { setMsg('请填写提示词', true); return; }
+  payload.use_context_ir = $('use-context-ir').checked;
+  setMsg('准备中…', false);
+  try {
+    const res = await fetch(BASE + '/prepare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setMsg('准备失败: ' + (data.detail || res.status), true);
+      hidePlan();
+      return;
+    }
+    currentPrepare = data;
+    currentPreparePayload = payload;
+    setMsg('已准备，查看下方计划后确认提交', false);
+    renderPlan(data);
+  } catch(e) {
+    setMsg('网络错误: ' + e.message, true);
+  }
+}
+
+async function commitPlan() {
+  if (!currentPrepare) return;
+  const prepareId = currentPrepare.prepare_id;
+  setMsg('提交中…', false);
+  $('plan-commit-btn').disabled = true;
+  try {
+    const res = await fetch(BASE + '/commit/' + encodeURIComponent(prepareId), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setMsg('提交失败: ' + (data.detail || res.status), true);
+      return;
+    }
+    setMsg('已提交，task_id: ' + data.task_id, false);
+    hidePlan();
+    $('detail-dl-btn').innerHTML =
+      '<a href="#" onclick="showTask(\'' + data.task_id + '\');return false">查看状态</a>';
+    showTask(data.task_id);
+    loadTasks();
+  } catch(e) {
+    setMsg('网络错误: ' + e.message, true);
+  } finally {
+    $('plan-commit-btn').disabled = false;
+  }
+}
+
+function cancelPlan() {
+  hidePlan();
+  setMsg('已取消准备', false);
+}
+
+// Original one-shot submit (used when "skip-confirm" is checked)
+async function submitTaskLegacy() {
+  setMsg('', false);
+  const payload = buildPayload();
+  if (!payload.prompt) { setMsg('请填写提示词', true); return; }
+  payload.use_context_ir = $('use-context-ir').checked;
   try {
     const res = await fetch(BASE + '/create', {
       method: 'POST',
@@ -334,6 +554,10 @@ async function submitTask() {
     setMsg('网络错误: ' + e.message, true);
   }
 }
+
+// Keep `submitTask` as an alias for backward-compat in case any browser
+// extension / automation still calls the old function name.
+async function submitTask() { return onSubmitClick(); }
 
 async function loadTasks() {
   try {
@@ -518,6 +742,29 @@ function setKeyMsg(text, isErr) {
 
 // Wire model select
 $('model').addEventListener('change', applyModelConstraints);
+
+// v0.1.3b: Context-IR checkbox live updates the status pill
+$('use-context-ir').addEventListener('change', function() {
+  if (this.checked) {
+    applyContextIrPill(false, false);
+    $('ir-pill').textContent = 'Context-IR: 默认开';
+  } else {
+    applyContextIrPill(false, false);
+    $('ir-pill').textContent = 'Context-IR: 已禁用';
+  }
+});
+
+// v0.1.3b: prompt toggle in the plan panel
+$('plan-prompt-toggle').addEventListener('click', function() {
+  const box = $('plan-prompt-box');
+  if (box.style.display === 'none') {
+    box.style.display = 'block';
+    this.textContent = this.textContent.replace('▾', '▴');
+  } else {
+    box.style.display = 'none';
+    this.textContent = this.textContent.replace('▴', '▾');
+  }
+});
 
 loadConfigStatus();
 </script>

@@ -6,7 +6,9 @@ import asyncio
 import json
 import os
 import sys
+import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -35,7 +37,24 @@ from .poller import (
     poll_until_done,
 )
 from .prompt import H3Prompt
-from .storage import TaskRecord, get_task, init_db, insert_task, list_tasks, update_task
+from .storage import (
+    PREPARE_STATUS_COMMITTED,
+    PREPARE_STATUS_PREPARED,
+    PREPARE_TTL_MS,
+    PrepareRecord,
+    TaskRecord,
+    delete_prepare,
+    get_prepare,
+    get_task,
+    init_db,
+    insert_prepare,
+    insert_task,
+    list_prepares,
+    list_tasks,
+    update_prepare_status,
+    update_task,
+)
+from .web import CreateBody, _build_plan, _run_multi_segment, _validate_mode
 
 # ---------------------------------------------------------------- try rich
 
@@ -500,6 +519,305 @@ def create_r2v(
     asyncio.run(_run())
 
 
+# ============================================================ v0.1.3b prepare / commit
+
+# Shared click options reused by the prepare r2v / t2v / i2v subcommands.
+_COMMON_PREPARE_OPTS = [
+    click.option("--prompt", required=True, help="Natural-language brief (will be sent through H3-Context-IR by default)."),
+    click.option("--model", "model", type=click.Choice(API_MODELS, case_sensitive=False), default="MiniMax-H3"),
+    click.option("--duration", type=int, default=None),
+    click.option("--ratio", default=None),
+    click.option("--resolution", default="768P"),
+    click.option("--no-context-ir", "use_context_ir", is_flag=True, default=True, help="Disable H3-Context-IR prompt rewrite (use raw prompt)."),
+    click.option("--yes", "auto_commit", is_flag=True, default=False, help="Auto-commit after prepare (skip review)."),
+]
+
+
+def _add_common_options(opts: list) -> list:
+    """Decorator helper: apply each click option in order (click requires this)."""
+    def wrap(fn):
+        for opt in reversed(opts):
+            fn = opt(fn)
+        return fn
+    return wrap
+
+
+def _print_prepare_plan(plan: dict) -> None:
+    """Human-friendly rendering of a /api/prepare response."""
+    if plan.get("warnings"):
+        _print("[yellow]⚠ Warnings:[/yellow]")
+        for w in plan["warnings"]:
+            _print(f"  • {w}")
+    if plan["segments"]:
+        _print(f"[cyan]Segments: {plan['estimated_segments']}[/cyan]")
+        for seg in plan["segments"]:
+            _print(f"  • {seg['index']}: {seg['start_seconds']:.2f}s + {seg['duration_seconds']}s")
+    if plan.get("used_context_ir"):
+        _print(f"[green]Context-IR: ✓ rewrote prompt ({len(plan['enhanced_prompt'])} chars)[/green]")
+    elif plan.get("context_ir_fallback"):
+        _print(f"[yellow]Context-IR: ⚠ fallback to original prompt[/yellow]")
+        if plan.get("context_ir_error"):
+            _print(f"  reason: {plan['context_ir_error']}")
+    _print("Content items:")
+    for i, item in enumerate(plan["content_preview"]):
+        kind = item.get("type", "?")
+        if kind == "text":
+            preview = (item.get("text") or "")[:80].replace("\n", " ")
+            _print(f"  [{i}] text: {preview}{'…' if len(item.get('text') or '') > 80 else ''}")
+        elif kind == "video_url":
+            _print(f"  [{i}] video_url: {item.get('url', '')[:80]}... (duration={item.get('duration')})")
+        elif kind == "image_url":
+            _print(f"  [{i}] image_url: {item.get('url', '')[:80]}... (role={item.get('role')})")
+        elif kind == "audio_url":
+            _print(f"  [{i}] audio_url: {item.get('url', '')[:80]}...")
+
+
+def _build_body_from_args(
+    mode: str, prompt: str, ref_image: tuple, ref_video: tuple, ref_audio: tuple,
+    duration, ratio, resolution, model, use_context_ir: bool,
+) -> dict:
+    """Translate CLI args into the dict shape that CreateBody.model_validate expects."""
+    body: dict = {
+        "mode": mode, "prompt": prompt, "model": model,
+        "duration": duration, "ratio": ratio, "resolution": resolution,
+        "ref_images": [], "ref_videos": [], "ref_audios": [],
+        "use_context_ir": use_context_ir,
+    }
+    for raw in ref_image:
+        path, role = _parse_ref(raw, "reference_image")
+        body["ref_images"].append({"path": path, "role": role})
+    for raw in ref_video:
+        path, role = _parse_ref(raw, "reference_video")
+        body["ref_videos"].append({"path": path, "role": role})
+    for raw in ref_audio:
+        path, role = _parse_ref(raw, "reference_audio")
+        body["ref_audios"].append({"path": path, "role": role})
+    return body
+
+
+def _save_plan(body_dict: dict, plan: dict) -> str:
+    """Persist a prepare plan. Returns the prepare_id."""
+    prepare_id = "prep-" + uuid.uuid4().hex[:12]
+    now_ms = int(time.time() * 1000)
+    rec = PrepareRecord(
+        prepare_id=prepare_id,
+        payload=body_dict,
+        plan=plan,
+        status=PREPARE_STATUS_PREPARED,
+        created_at=now_ms,
+        expires_at=now_ms + PREPARE_TTL_MS,
+    )
+    insert_prepare(rec)
+    return prepare_id
+
+
+async def _commit_plan_local(
+    prepare_id: str, cfg: Config, wait: bool
+) -> str:
+    """Commit a prepared plan from the CLI (same path as POST /api/commit)."""
+    import uuid as _uuid
+    rec = get_prepare(prepare_id)
+    if rec is None:
+        raise MiniPicError(f"prepare {prepare_id} not found")
+    if rec.status == PREPARE_STATUS_COMMITTED:
+        raise MiniPicError(f"prepare {prepare_id} already committed")
+    if rec.expires_at <= int(time.time() * 1000):
+        raise MiniPicError(f"prepare {prepare_id} has expired; please re-prepare")
+
+    body = rec.payload
+    content = rec.plan.get("content", [])
+    segments_meta = rec.plan.get("segments", [])
+
+    parent_id = "task-" + _uuid.uuid4().hex[:12]
+    parent_rec = TaskRecord(
+        task_id=parent_id,
+        mode="multi",
+        prompt_excerpt=(body.get("prompt") or "")[:100],
+        status="submitted",
+        extra={
+            "prepare_id": prepare_id,
+            "segments": [],
+            "total_duration_seconds": (
+                sum(s["duration_seconds"] for s in segments_meta)
+                if segments_meta else None
+            ),
+            "enhanced_prompt": rec.plan.get("enhanced_prompt"),
+            "used_context_ir": rec.plan.get("used_context_ir", False),
+            "context_ir_fallback": rec.plan.get("context_ir_fallback", False),
+        },
+    )
+    insert_task(parent_rec)
+    update_prepare_status(prepare_id, PREPARE_STATUS_COMMITTED, task_id=parent_id)
+
+    if wait:
+        # Run inline so --wait blocks the CLI until done.
+        await _run_multi_segment(parent_id, body, content, segments_meta, cfg)
+    else:
+        # Fire-and-forget; the task runs in the background of this asyncio loop.
+        asyncio.create_task(
+            _run_multi_segment(parent_id, body, content, segments_meta, cfg)
+        )
+    return parent_id
+
+
+# ---------- prepare group
+
+@click.group(name="prepare")
+def prepare_group() -> None:
+    """Prepare a generation plan (no H3 call). Use 'minipic commit' to submit."""
+    pass
+
+
+@prepare_group.command(name="t2v")
+@click.option("--prompt", required=True)
+@click.option("--ratio", required=True)
+@click.option("--duration", type=int, default=None)
+@click.option("--resolution", default="768P")
+@click.option("--model", type=click.Choice(API_MODELS, case_sensitive=False), default="MiniMax-H3")
+@click.option("--no-context-ir", "use_context_ir", is_flag=True, default=True)
+@click.option("--yes", "auto_commit", is_flag=True, default=False)
+def prepare_t2v(
+    prompt: str, ratio: str, duration, resolution, model,
+    use_context_ir: bool, auto_commit: bool,
+) -> None:
+    """Prepare a text-to-video plan."""
+    cfg = load_config()
+    require_api_key(cfg)
+    ensure_dirs()
+    init_db()
+
+    body_dict = _build_body_from_args(
+        "t2v", prompt, (), (), (), duration, ratio, resolution, model, use_context_ir,
+    )
+    body = CreateBody.model_validate(body_dict)
+    _validate_mode(body)
+
+    asyncio.run(_do_prepare(body, body_dict, cfg, auto_commit))
+
+
+@prepare_group.command(name="i2v")
+@click.option("--prompt", required=True)
+@click.option("--ref-image", required=True)
+@click.option("--ref-image-role", default="first_frame")
+@click.option("--duration", type=int, default=None)
+@click.option("--resolution", default="768P")
+@click.option("--model", type=click.Choice(API_MODELS, case_sensitive=False), default="MiniMax-H3")
+@click.option("--no-context-ir", "use_context_ir", is_flag=True, default=True)
+@click.option("--yes", "auto_commit", is_flag=True, default=False)
+def prepare_i2v(
+    prompt: str, ref_image: str, ref_image_role: str, duration, resolution, model,
+    use_context_ir: bool, auto_commit: bool,
+) -> None:
+    """Prepare an image-to-video plan."""
+    cfg = load_config()
+    require_api_key(cfg)
+    ensure_dirs()
+    init_db()
+    body_dict = _build_body_from_args(
+        "i2v", prompt, (f"{ref_image}:{ref_image_role}",), (), (), duration, None, resolution, model, use_context_ir,
+    )
+    body = CreateBody.model_validate(body_dict)
+    _validate_mode(body)
+    asyncio.run(_do_prepare(body, body_dict, cfg, auto_commit))
+
+
+@prepare_group.command(name="r2v")
+@click.option("--prompt", required=True)
+@click.option("--ref-image", multiple=True)
+@click.option("--ref-video", multiple=True)
+@click.option("--ref-audio", multiple=True)
+@click.option("--duration", type=int, default=None)
+@click.option("--ratio", default="adaptive")
+@click.option("--resolution", default="768P")
+@click.option("--model", type=click.Choice(API_MODELS, case_sensitive=False), default="MiniMax-H3")
+@click.option("--no-context-ir", "use_context_ir", is_flag=True, default=True)
+@click.option("--yes", "auto_commit", is_flag=True, default=False)
+def prepare_r2v(
+    prompt: str, ref_image, ref_video, ref_audio,
+    duration, ratio, resolution, model,
+    use_context_ir: bool, auto_commit: bool,
+) -> None:
+    """Prepare a reference-to-video plan (multi-segment for >15s reference videos)."""
+    cfg = load_config()
+    require_api_key(cfg)
+    ensure_dirs()
+    init_db()
+    body_dict = _build_body_from_args(
+        "r2v", prompt, ref_image, ref_video, ref_audio,
+        duration, ratio, resolution, model, use_context_ir,
+    )
+    body = CreateBody.model_validate(body_dict)
+    _validate_mode(body)
+    asyncio.run(_do_prepare(body, body_dict, cfg, auto_commit))
+
+
+async def _do_prepare(body: CreateBody, body_dict: dict, cfg: Config, auto_commit: bool) -> None:
+    """Shared core for `minipic prepare *` subcommands."""
+    try:
+        plan = await _build_plan(body, cfg)
+    except (MiniPicError, OSError) as e:
+        _print(f"[red]准备失败: {e}[/red]")
+        raise SystemExit(1)
+
+    prepare_id = _save_plan(body_dict, plan)
+    response = {
+        "prepare_id": prepare_id,
+        "estimated_segments": max(len(plan["segments"]), 1),
+        "segments": plan["segments"],
+        "content_preview": plan["content"],
+        "warnings": plan["warnings"],
+        "expires_at": int(time.time() * 1000) + PREPARE_TTL_MS,
+        **plan,
+    }
+    _print(f"[green]Prepared: {prepare_id}[/green]")
+    _print(f"  Expires in 24h. Run `minipic commit {prepare_id}` to submit.")
+    _print_prepare_plan(response)
+
+    if auto_commit:
+        parent_id = await _commit_plan_local(prepare_id, cfg, wait=False)
+        _print(f"[green]Auto-committed. Task: {parent_id}[/green]")
+        _print("  (Running in the background; use `minipic list` to check progress.)")
+
+
+# ---------- commit
+
+@click.command(name="commit")
+@click.argument("prepare_id")
+@click.option("--wait/--no-wait", default=False, help="Block until the task finishes.")
+def commit_cmd(prepare_id: str, wait: bool) -> None:
+    """Commit a prepared plan to H3 (creates the actual task)."""
+    cfg = load_config()
+    require_api_key(cfg)
+    ensure_dirs()
+    init_db()
+    try:
+        parent_id = asyncio.run(_commit_plan_local(prepare_id, cfg, wait))
+    except MiniPicError as e:
+        _print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+    _print(f"[green]Task submitted: {parent_id}[/green]")
+    if not wait:
+        _print("  (Running in the background; use `minipic list` to check progress.)")
+
+
+# ---------- prepares list
+
+@click.command(name="prepares")
+@click.option("--limit", type=int, default=20)
+def list_prepares_cmd(limit: int) -> None:
+    """List recent (non-expired) prepare records."""
+    init_db()
+    rows = list_prepares(include_expired=False, limit=limit)
+    if not rows:
+        _print("No active prepares.")
+        return
+    for r in rows:
+        ts = r.created_at / 1000
+        import datetime as _dt
+        dt = _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        _print(f"[bold]{r.prepare_id}[/bold]  {r.status}  {dt}  task={r.task_id or '—'}")
+
+
 def _parse_ref(raw: str, default_role: str) -> tuple[str, str]:
     """Parse 'path_or_url[:role]' into (source, role).
 
@@ -726,6 +1044,9 @@ def main() -> None:
 # Register all subcommands / groups
 main.add_command(config_group)
 main.add_command(create_group)
+main.add_command(prepare_group)
+main.add_command(commit_cmd, name="commit")
+main.add_command(list_prepares_cmd, name="prepares")
 main.add_command(status)
 main.add_command(wait_cmd, name="wait")
 main.add_command(list_cmd, name="list")
