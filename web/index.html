@@ -155,7 +155,7 @@ details.advanced[open] summary { margin-bottom: 8px; }
   <textarea id="prompt" placeholder="描述你想生成的视频内容"></textarea>
 
   <label for="duration">时长（秒，<span id="duration-range-label">4-15</span>）</label>
-  <input type="number" id="duration" value="10" min="4" max="15">
+  <input type="number" id="duration" value="10" min="4" max="15" title="每段生成的时长。R2V 多段模式下由参考视频切段决定，此值无效。">
   <span id="duration-summary" style="margin-left:8px;color:#666;font-size:0.9em;"></span>
 
   <label for="ratio">比例（t2v 专用）</label>
@@ -690,11 +690,13 @@ let modelConstraints = null;  // populated by loadConfigStatus()
 function updateDurationSummary() {
   const summary = $('duration-summary');
   if (!summary) return;
+  const durInput = $('duration');
   const refPaths = Array.from(document.querySelectorAll('#ref-videos .ref-row input[type=text]'))
     .map(function(i) { return i.value.trim(); })
     .filter(Boolean);
   if (refPaths.length === 0) {
     summary.textContent = '';
+    if (durInput) { durInput.disabled = false; durInput.title = ''; }
     return;
   }
   // R2V multi-segment: output duration is determined by how we split the
@@ -708,10 +710,19 @@ function updateDurationSummary() {
       const ref = d.duration;
       const segs = Math.min(4, Math.max(1, Math.ceil(ref / 15)));
       const total = Math.round(ref);
-      if (segs === 1) {
-        summary.textContent = '单段输出 ≈ ' + total + 's（参考视频 ' + ref.toFixed(1) + 's）';
-      } else {
+      const isMulti = segs > 1;
+      if (isMulti) {
         summary.textContent = '多段输出 ≈ ' + total + 's（参考视频 ' + ref.toFixed(1) + 's 切 ' + segs + ' 段喂 H3，时长由参考决定）';
+        if (durInput) {
+          durInput.disabled = true;
+          durInput.title = 'R2V 多段模式下由参考视频切段决定，此值无效';
+        }
+      } else {
+        summary.textContent = '单段输出 ≈ ' + total + 's（参考视频 ' + ref.toFixed(1) + 's）';
+        if (durInput) {
+          durInput.disabled = false;
+          durInput.title = '每段生成的时长';
+        }
       }
     })
     .catch(function() { summary.textContent = ''; });
