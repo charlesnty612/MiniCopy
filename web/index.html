@@ -325,6 +325,7 @@ function buildPayload() {
   const mode = getMode();
   const payload = {
     mode: mode,
+    model: $('model').value,
     prompt: $('prompt').value.trim(),
     duration: parseInt($('duration').value, 10),
     resolution: $('resolution').value,
