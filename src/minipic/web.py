@@ -195,6 +195,13 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                 status_code=400,
                 detail=f"准备失败: {e}\n\n提示: 检查参考视频路径/格式（mp4/mov/≤50MB）",
             )
+        except ConfigError as e:
+            # H3 upload / account-level rejection — surface as 400 so the UI
+            # can show the actual reason instead of "Internal Server Error".
+            raise HTTPException(
+                status_code=400,
+                detail=f"准备失败: {e}\n\n提示: 这通常是 API key 权限不足（TokenPlan 不支持某些高级参数）。如需完整功能请使用 pay-as-you-go key。",
+            )
 
         prepare_id = "prep-" + uuid.uuid4().hex[:12]
         body_dict = body.model_dump()

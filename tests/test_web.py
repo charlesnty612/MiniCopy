@@ -941,6 +941,46 @@ class TestApiPrepareModeValidation:
         assert "reference" in resp.json()["detail"].lower()
 
 
+# ============================================================ v0.1.7 ConfigError → 400
+class TestApiPrepareConfigError:
+    """When _build_plan raises ConfigError (e.g. H3 rejects the upload with
+    2013 'invalid params'), the endpoint must surface it as 400 with a
+    readable detail — not 500 with HTML body. TokenPlan keys hit this path."""
+
+    def test_prepare_400_when_build_plan_raises_config_error(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+        tmp_file
+    ) -> None:
+        """When client.upload_file raises ConfigError (H3 2013), prepare must
+        surface it as 400 + readable hint, not 500 HTML."""
+        from minipic.errors import ConfigError
+        import minipic.web as web_mod
+
+        # 1. Bypass ffprobe (fake file would fail probing).
+        monkeypatch.setattr(web_mod, "ffprobe_duration", lambda _p: 10.0)
+        # 2. Bypass the H3 upload + resolve step; raise the real ConfigError
+        #    that a TokenPlan key would get from H3 (2013 invalid file purpose).
+        async def _raise_upload(*_args, **_kwargs):
+            raise ConfigError(
+                "upload response missing file_id: "
+                "{'file': None, 'base_resp': {'status_code': 2013, "
+                "'status_msg': 'invalid params, invalid file purpose'}}"
+            )
+        monkeypatch.setattr(web_mod, "resolve_reference", _raise_upload)
+
+        ref = tmp_file("ref.mp4", b"\x00" * 100)
+        resp = web_client.post("/api/prepare", json={
+            "mode": "r2v", "prompt": "hi",
+            "model": "MiniMax-H3", "duration": 5, "resolution": "768P",
+            "ref_videos": [{"path": str(ref)}],
+        })
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert "2013" in detail
+        # Hint about pay-as-you-go / TokenPlan should appear.
+        assert "pay-as-you-go" in detail.lower() or "tokenplan" in detail.lower()
+
+
 class TestApiPrepareHappyPath:
     def test_t2v_returns_plan_without_h3_submit(
         self, web_client: TestClient, fake_client_factory
