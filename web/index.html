@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>minipic</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #f7f7f7; color: #222; line-height: 1.5; padding: 24px; }
+h1 { font-size: 1.4rem; margin-bottom: 4px; }
+h2 { font-size: 1.1rem; margin: 24px 0 8px; }
+p.sub { color: #666; font-size: 0.85rem; margin-bottom: 20px; }
+
+.card { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 16px; margin-bottom: 16px; max-width: 640px; }
+
+label { display: block; font-size: 0.85rem; font-weight: 600; margin: 10px 0 4px; color: #333; }
+
+input[type=text], input[type=number], textarea, select { width: 100%; padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; font-size: 0.9rem; }
+textarea { resize: vertical; min-height: 80px; font-family: inherit; }
+input:disabled, select:disabled { background: #eee; color: #888; }
+
+.row { display: flex; gap: 8px; align-items: flex-end; margin-top: 6px; }
+.row > * { flex: 1; }
+
+.mode-radios { display: flex; gap: 16px; margin: 8px 0; }
+.mode-radios label { font-weight: normal; margin: 0; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.mode-radios input[type=radio] { width: auto; }
+
+.btn { padding: 7px 16px; border: 1px solid #bbb; border-radius: 4px; background: #eee; cursor: pointer; font-size: 0.85rem; }
+.btn:hover { background: #ddd; }
+.btn-primary { background: #0066cc; color: #fff; border-color: #0055aa; }
+.btn-primary:hover { background: #0055aa; }
+.btn-small { padding: 4px 10px; font-size: 0.8rem; }
+.btn-danger { background: #fff; color: #c00; border-color: #c00; }
+.btn-danger:hover { background: #fee; }
+
+.ref-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.ref-row input[type=text] { flex: 2; }
+.ref-row select { flex: 1; min-width: 120px; }
+.ref-row .btn-small { flex: 0; white-space: nowrap; }
+
+.media-section { margin: 10px 0 4px; display: flex; gap: 6px; align-items: center; }
+.media-section span { font-size: 0.8rem; color: #555; }
+
+#msg { margin: 8px 0; font-size: 0.9rem; }
+#msg.ok { color: #060; }
+#msg.err { color: #c00; }
+
+.task-list { list-style: none; }
+.task-list li { border-bottom: 1px solid #eee; padding: 8px 0; font-size: 0.85rem; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.task-list li:last-child { border-bottom: none; }
+.task-id { font-family: monospace; font-size: 0.8rem; color: #555; }
+.task-mode { background: #e8f0ff; padding: 1px 5px; border-radius: 3px; font-size: 0.75rem; }
+.task-status { font-weight: 600; }
+.task-status.succeeded, .task-status.Success { color: #060; }
+.task-status.failed, .task-status.Failed { color: #c00; }
+.task-status.Queuing, .task-status.Processing, .task-status.Pending { color: #a60; }
+.ts { color: #999; font-size: 0.75rem; }
+
+.detail-json { background: #f0f0f0; border: 1px solid #ccc; border-radius: 4px; padding: 10px; font-family: monospace; font-size: 0.78rem; white-space: pre-wrap; word-break: break-all; max-height: 400px; overflow-y: auto; }
+
+#detail-panel { display: none; margin-top: 16px; }
+#detail-panel h3 { font-size: 0.95rem; margin-bottom: 8px; }
+
+.checkbox-label { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-weight: normal; font-size: 0.85rem; cursor: pointer; }
+</style>
+</head>
+<body>
+<h1>minipic</h1>
+<p class="sub">MiniMax H3 视频生成 · 本地 UI</p>
+
+<div class="card">
+  <h2>创建任务</h2>
+
+  <div class="mode-radios">
+    <label><input type="radio" name="mode" value="t2v"> t2v（文生视频）</label>
+    <label><input type="radio" name="mode" value="i2v"> i2v（首帧图生视频）</label>
+    <label><input type="radio" name="mode" value="r2v" checked> r2v（多模态参考）</label>
+  </div>
+
+  <label for="prompt">提示词</label>
+  <textarea id="prompt" placeholder="描述你想生成的视频内容"></textarea>
+
+  <label for="duration">时长（秒，4-15）</label>
+  <input type="number" id="duration" value="10" min="4" max="15">
+
+  <label for="ratio">比例（t2v 专用）</label>
+  <select id="ratio">
+    <option value="">-- 选择比例 --</option>
+    <option value="adaptive">adaptive</option>
+    <option value="16:9">16:9</option>
+    <option value="9:16">9:16</option>
+    <option value="1:1">1:1</option>
+    <option value="4:3">4:3</option>
+    <option value="3:4">3:4</option>
+    <option value="21:9">21:9</option>
+  </select>
+
+  <label for="resolution">分辨率</label>
+  <select id="resolution">
+    <option value="768P" selected>768P</option>
+    <option value="2K">2K</option>
+  </select>
+
+  <!-- i2v: one image row -->
+  <div id="i2v-row" style="display:none">
+    <label>首帧图路径</label>
+    <div class="ref-row" id="i2v-ref-row">
+      <input type="text" placeholder="/path/to/image.png">
+      <select>
+        <option value="first_frame" selected>first_frame</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- r2v: dynamic media rows -->
+  <div id="r2v-section" style="display:none">
+    <div class="media-section">
+      <span>参考图：</span>
+      <button class="btn btn-small" onclick="addRef('image')">+ 图片</button>
+    </div>
+    <div id="ref-images"></div>
+
+    <div class="media-section">
+      <span>参考视频：</span>
+      <button class="btn btn-small" onclick="addRef('video')">+ 视频</button>
+    </div>
+    <div id="ref-videos"></div>
+
+    <div class="media-section">
+      <span>参考音频：</span>
+      <button class="btn btn-small" onclick="addRef('audio')">+ 音频</button>
+    </div>
+    <div id="ref-audios"></div>
+  </div>
+
+  <label class="checkbox-label">
+    <input type="checkbox" id="wait">
+    <span>等待结果（阻塞请求直到视频生成完成，可能需要 15-30 分钟）</span>
+  </label>
+
+  <div style="margin-top:14px; display:flex;gap:8px;align-items:center">
+    <button class="btn btn-primary" onclick="submitTask()">提交任务</button>
+    <span id="msg"></span>
+  </div>
+</div>
+
+<div class="card" id="detail-panel">
+  <h3>任务详情</h3>
+  <div id="detail-json" class="detail-json"></div>
+  <p style="margin-top:8px;font-size:0.85rem">
+    <span id="detail-dl-btn"></span>
+    <button class="btn btn-small" onclick="closeDetail()" style="margin-left:8px">关闭</button>
+  </p>
+</div>
+
+<div class="card">
+  <h2>最近任务 <button class="btn btn-small" onclick="loadTasks()" style="margin-left:12px">刷新</button></h2>
+  <ul class="task-list" id="task-list"><li style="color:#999">加载中…</li></ul>
+</div>
+
+<script>
+const BASE = '/api';
+let taskCount = 0;
+
+function $(id) { return document.getElementById(id); }
+
+function getMode() { return document.querySelector('input[name="mode"]:checked').value; }
+
+// Toggle visibility of mode-specific fields
+document.querySelectorAll('input[name="mode"]').forEach(function(el) {
+  el.addEventListener('change', updateModeUI);
+});
+
+function updateModeUI() {
+  const m = getMode();
+  $('i2v-row').style.display = m === 'i2v' ? 'block' : 'none';
+  $('r2v-section').style.display = m === 'r2v' ? 'block' : 'none';
+  $('ratio').disabled = m !== 't2v';
+}
+updateModeUI();
+
+// Dynamic ref row management
+function addRef(type) {
+  const containerId = type === 'image' ? 'ref-images' : type === 'video' ? 'ref-videos' : 'ref-audios';
+  const container = $(containerId);
+  const row = document.createElement('div');
+  row.className = 'ref-row';
+
+  if (type === 'image') {
+    row.innerHTML =
+      '<input type="text" placeholder="/path/to/image.png">' +
+      '<select>' +
+        '<option value="reference_image" selected>reference_image</option>' +
+        '<option value="first_frame">first_frame</option>' +
+      '</select>' +
+      '<button class="btn btn-small btn-danger" onclick="this.parentNode.remove()">×</button>';
+  } else if (type === 'video') {
+    row.innerHTML =
+      '<input type="text" placeholder="/path/to/video.mp4">' +
+      '<input type="text" placeholder="clips (0:5,30:5)" title="留空自动采样">' +
+      '<button class="btn btn-small btn-danger" onclick="this.parentNode.remove()">×</button>';
+  } else {
+    row.innerHTML =
+      '<input type="text" placeholder="/path/to/audio.mp3">' +
+      '<button class="btn btn-small btn-danger" onclick="this.parentNode.remove()">×</button>';
+  }
+  container.appendChild(row);
+}
+
+function buildPayload() {
+  const mode = getMode();
+  const payload = {
+    mode: mode,
+    prompt: $('prompt').value.trim(),
+    duration: parseInt($('duration').value, 10),
+    resolution: $('resolution').value,
+    ratio: mode === 'i2v' ? null : $('ratio').value || null,
+    ref_images: [],
+    ref_videos: [],
+    ref_audios: [],
+    wait: $('wait').checked,
+  };
+
+  if (mode === 'i2v') {
+    const row = $('i2v-ref-row');
+    const pathInput = row.querySelector('input');
+    if (pathInput.value.trim()) {
+      payload.ref_images.push({ path: pathInput.value.trim(), role: 'first_frame' });
+    }
+  } else if (mode === 'r2v') {
+    $('ref-images').querySelectorAll('.ref-row').forEach(function(row) {
+      const path = row.querySelector('input').value.trim();
+      if (path) {
+        payload.ref_images.push({
+          path: path,
+          role: row.querySelector('select') ? row.querySelector('select').value : 'reference_image',
+        });
+      }
+    });
+    $('ref-videos').querySelectorAll('.ref-row').forEach(function(row) {
+      const path = row.querySelector('input').value.trim();
+      const clips = row.querySelectorAll('input')[1];
+      if (path) {
+        payload.ref_videos.push({
+          path: path,
+          clips: clips && clips.value.trim() || null,
+        });
+      }
+    });
+    $('ref-audios').querySelectorAll('.ref-row').forEach(function(row) {
+      const path = row.querySelector('input').value.trim();
+      if (path) payload.ref_audios.push({ path: path });
+    });
+  }
+  return payload;
+}
+
+function setMsg(text, isErr) {
+  const el = $('msg');
+  el.textContent = text;
+  el.className = isErr ? 'err' : 'ok';
+}
+
+async function submitTask() {
+  setMsg('', false);
+  const payload = buildPayload();
+  if (!payload.prompt) { setMsg('请填写提示词', true); return; }
+  try {
+    const res = await fetch(BASE + '/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setMsg('错误: ' + (data.detail || data.error || res.status), true);
+      return;
+    }
+    setMsg('已提交，task_id: ' + data.task_id, false);
+    $('detail-dl-btn').innerHTML =
+      '<a href="#" onclick="showTask(\'' + data.task_id + '\');return false">查看状态</a>';
+    showTask(data.task_id);
+    loadTasks();
+  } catch(e) {
+    setMsg('网络错误: ' + e.message, true);
+  }
+}
+
+async function loadTasks() {
+  try {
+    const res = await fetch(BASE + '/tasks');
+    const tasks = await res.json();
+    const ul = $('task-list');
+    if (!tasks || tasks.length === 0) {
+      ul.innerHTML = '<li style="color:#999">暂无任务</li>';
+      return;
+    }
+    ul.innerHTML = tasks.map(function(t) {
+      const time = new Date(t.submitted_at).toLocaleString('zh-CN', {timeZone:'Asia/Shanghai'});
+      const dl = (t.output_path || (t.status === 'Success' || t.status === 'succeeded'))
+        ? '<a href="#" onclick="downloadTask(\'' + t.task_id + '\');return false">下载</a>'
+        : '';
+      return '<li>' +
+        '<span class="task-id">' + escHtml(t.task_id) + '</span> ' +
+        '<span class="task-mode">' + escHtml(t.mode) + '</span> ' +
+        '<span class="task-status ' + escHtml(t.status) + '">' + escHtml(t.status) + '</span> ' +
+        '<span class="ts">' + time + '</span> ' +
+        '<a href="#" onclick="showTask(\'' + t.task_id + '\');return false">详情</a> ' +
+        dl +
+      '</li>';
+    }).join('');
+  } catch(e) {
+    $('task-list').innerHTML = '<li style="color:#c00">加载失败: ' + escHtml(e.message) + '</li>';
+  }
+}
+
+async function showTask(taskId) {
+  try {
+    const res = await fetch(BASE + '/tasks/' + taskId);
+    if (!res.ok) {
+      alert('任务不存在'); return;
+    }
+    const t = await res.json();
+    $('detail-json').textContent = JSON.stringify(t, null, 2);
+    let dl = '';
+    const url = t.content_url || t.output_path;
+    if (url) {
+      dl = '<a href="/api/tasks/' + taskId + '/download">下载视频</a>';
+    }
+    $('detail-dl-btn').innerHTML = dl;
+    $('detail-panel').style.display = 'block';
+  } catch(e) {
+    alert('加载失败: ' + e.message);
+  }
+}
+
+function closeDetail() { $('detail-panel').style.display = 'none'; }
+
+function downloadTask(taskId) {
+  window.location.href = '/api/tasks/' + taskId + '/download';
+}
+
+function escHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Poll
+loadTasks();
+setInterval(loadTasks, 5000);
+</script>
+</body>
+</html>
