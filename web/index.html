@@ -697,20 +697,22 @@ function updateDurationSummary() {
     summary.textContent = '';
     return;
   }
-  const seconds = parseInt($('duration').value, 10);
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    summary.textContent = '';
-    return;
-  }
-  // Probe the first reference video's duration (best-effort).
+  // R2V multi-segment: output duration is determined by how we split the
+  // reference video (plan_segments), NOT by the duration input. The duration
+  // input is only honored when the reference is short enough for a single
+  // segment (≤15s).
   fetch(BASE + '/probe/video?path=' + encodeURIComponent(refPaths[0]))
     .then(function(r) { return r.ok ? r.json() : null; })
     .then(function(d) {
       if (!d || !Number.isFinite(d.duration)) { summary.textContent = ''; return; }
       const ref = d.duration;
-      const segs = Math.min(4, Math.max(1, Math.ceil(ref / seconds)));
-      const total = segs * seconds;
-      summary.textContent = '预计输出 ≈ ' + segs + ' 段 × ' + seconds + 's = ' + total + 's';
+      const segs = Math.min(4, Math.max(1, Math.ceil(ref / 15)));
+      const total = Math.round(ref);
+      if (segs === 1) {
+        summary.textContent = '单段输出 ≈ ' + total + 's（参考视频 ' + ref.toFixed(1) + 's）';
+      } else {
+        summary.textContent = '多段输出 ≈ ' + total + 's（参考视频 ' + ref.toFixed(1) + 's 切 ' + segs + ' 段喂 H3，时长由参考决定）';
+      }
     })
     .catch(function() { summary.textContent = ''; });
 }
