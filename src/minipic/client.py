@@ -78,7 +78,7 @@ class MiniMaxClient:
 
     # ---------------------------------------------------------------- upload
 
-    async def upload_file(self, path: Path, purpose: str = "video_reference") -> str:
+    async def upload_file(self, path: Path, purpose: str = "video_generation_input") -> str:
         """Upload a local file to V1 file management. Returns the file_id."""
         if not path.is_file():
             raise ConfigError(f"file not found: {path}")
