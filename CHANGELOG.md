@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.1] - 2026-09-02
+
+### Fixed
+- **HOTFIX 绿色免安装包媒体时长探测失败（WinError 2）**：`media.ffprobe_duration()` 之前从 ffmpeg 路径字符串推导 ffprobe 路径，但 `imageio-ffmpeg` 只内置 ffmpeg（且二进制名形如 `ffmpeg-win-x86_64-v7.1.exe`），小白机器无系统 ffprobe 时推导路径不存在 → `FileNotFoundError` → `WinError 2`。改为调用 ffmpeg 自身 `-hide_banner -i` 探测，从 stderr 解析 `Duration: HH:MM:SS.xx`，去掉对 ffprobe 的依赖。函数名 `ffprobe_duration` 保持不变（调用方零修改）。
+
+### Changed
+- `src/minipic/media.py` 删除 `json` import（已被 `resolve_reference` 复用，本次实现不再用到）；`src/minipic/web.py:363` 注释 "ffprobe fails" → "probe fails"。
+
+### Verification
+- `tests/test_media.py::TestFfprobeDuration` 5 个新用例（stderr 解析 / 小时位时长 / 解析不到 Duration / FileNotFoundError / TimeoutExpired），全部 mock `subprocess.run`，不碰真实二进制。
+
 ## [0.2.0] - 2026-09-01
 
 ### Changed

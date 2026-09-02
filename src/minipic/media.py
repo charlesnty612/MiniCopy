@@ -71,20 +71,34 @@ def find_ffmpeg() -> str:
 
 
 def ffprobe_duration(path: Path) -> float:
-    """Return the duration of a media file in seconds (float)."""
-    ffmpeg = find_ffmpeg()  # ffprobe ships with the same package
-    ffprobe = ffmpeg.replace("ffmpeg", "ffprobe") if "ffmpeg" in Path(ffmpeg).name else "ffprobe"
-    ffprobe = shutil.which("ffprobe") or ffprobe
+    """Return the duration of a media file in seconds (float).
+
+    Uses ffmpeg's own ``-i`` probe (stderr parses ``Duration: HH:MM:SS.xx``),
+    no separate ffprobe binary required. The imageio-ffmpeg bundled binary
+    only ships ffmpeg, so we avoid depending on a system ffprobe.
+    """
+    ffmpeg = find_ffmpeg()
+    # ffmpeg always exits non-zero when only -i (no output spec) is given;
+    # ignore returncode and parse stderr instead.
     try:
-        out = subprocess.check_output(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "json", str(path)],
-            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", str(path)],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=30,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        raise MediaError(f"ffprobe failed for {path}: {e}") from e
-    data = json.loads(out)
-    return float(data["format"]["duration"])
+    except subprocess.TimeoutExpired as e:
+        raise MediaError(f"media probe failed for {path}: {e}") from e
+    except OSError as e:
+        raise MediaError(f"media probe failed for {path}: {e}") from e
+    blob = (result.stderr or "") + "\n" + (result.stdout or "")
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", blob)
+    if not m:
+        raise MediaError(
+            f"无法读取媒体时长（文件可能损坏或格式不支持）: {path}"
+        )
+    h, mn, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+    return h * 3600.0 + mn * 60.0 + s
 
 
 # ----------------------------------------------------------------- upload
