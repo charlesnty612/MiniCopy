@@ -1107,6 +1107,8 @@ class TestApiConfigEndpoints:
         max_m = next(m for m in data["models"] if m["name"] == "MiniMax-H3-Max")
         assert "2K" not in max_m["resolutions"]
         assert max_m["duration_min"] == 5
+        # v0.2.2+: server version is exposed to the UI for footer display
+        assert data["version"] == "0.2.2"
 
     def test_get_handles_missing_key(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

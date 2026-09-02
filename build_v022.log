@@ -1,0 +1,153 @@
+=== [1/4] ��� Python �� venv ===
+=== [2/4] ��װ / ���´��������pyinstaller + pillow�� ===
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+Requirement already satisfied: pyinstaller in .\.venv\Lib\site-packages (6.22.2)
+Requirement already satisfied: pillow in .\.venv\Lib\site-packages (12.3.0)
+Requirement already satisfied: altgraph in .\.venv\Lib\site-packages (from pyinstaller) (0.17.5)
+Requirement already satisfied: packaging>=22.0 in .\.venv\Lib\site-packages (from pyinstaller) (26.3)
+Requirement already satisfied: pefile>=2022.5.30 in .\.venv\Lib\site-packages (from pyinstaller) (2024.8.26)
+Requirement already satisfied: pyinstaller-hooks-contrib>=2026.6 in .\.venv\Lib\site-packages (from pyinstaller) (2026.7)
+Requirement already satisfied: pywin32-ctypes>=0.2.1 in .\.venv\Lib\site-packages (from pyinstaller) (0.2.3)
+Requirement already satisfied: setuptools>=42.0.0 in .\.venv\Lib\site-packages (from pyinstaller) (79.0.1)
+=== [3/4] ���� build\logo.ico���� Pillow �� web\assets\logo.png ת�ɶ�ߴ� ico�� ===
+=== [4/4] PyInstaller �����one-folder������̨���� ===
+126 INFO: PyInstaller: 6.22.2, contrib hooks: 2026.7
+126 INFO: Python: 3.11.15
+141 INFO: Platform: Windows-10-10.0.26200-SP0
+141 INFO: Python environment: D:\zcodeproject\minipic\.venv
+141 INFO: wrote D:\zcodeproject\minipic\MiniCopy.spec
+143 INFO: Removing temporary files and cleaning cache in C:\Users\aistation\AppData\Local\pyinstaller
+934 INFO: Module search paths (PYTHONPATH):
+['D:\\zcodeproject\\minipic\\.venv\\Scripts\\pyinstaller.exe',
+ 'C:\\Users\\aistation\\AppData\\Roaming\\uv\\python\\cpython-3.11.15-windows-x86_64-none\\python311.zip',
+ 'C:\\Users\\aistation\\AppData\\Roaming\\uv\\python\\cpython-3.11.15-windows-x86_64-none\\DLLs',
+ 'C:\\Users\\aistation\\AppData\\Roaming\\uv\\python\\cpython-3.11.15-windows-x86_64-none\\Lib',
+ 'C:\\Users\\aistation\\AppData\\Roaming\\uv\\python\\cpython-3.11.15-windows-x86_64-none',
+ 'D:\\zcodeproject\\minipic\\.venv',
+ 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages',
+ 'D:\\zcodeproject\\minipic\\src',
+ 'D:\\zcodeproject\\minipic\\src']
+1216 INFO: Appending 'datas' from .spec
+1219 INFO: checking Analysis
+1219 INFO: Building Analysis because Analysis-00.toc is non existent
+1219 INFO: Looking for Python shared library...
+1219 INFO: Using Python shared library: C:\Users\aistation\AppData\Roaming\uv\python\cpython-3.11.15-windows-x86_64-none\python311.dll
+1219 INFO: Running Analysis Analysis-00.toc
+1219 INFO: Target bytecode optimization level: 0
+1219 INFO: Initializing module dependency graph...
+1220 INFO: Initializing module graph hook caches...
+1230 INFO: Analyzing modules for base_library.zip ...
+2113 INFO: Processing standard module hook 'hook-heapq.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+2184 INFO: Processing standard module hook 'hook-encodings.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+3357 INFO: Processing standard module hook 'hook-math.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+3429 INFO: Processing standard module hook 'hook-pickle.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+4901 INFO: Caching module dependency graph...
+4932 INFO: Analyzing D:\zcodeproject\minipic\src\minipic\frozen_main.py
+4948 INFO: Processing standard module hook 'hook-webbrowser.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+4963 INFO: Processing standard module hook 'hook-uvicorn.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+5364 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+5479 INFO: Processing standard module hook 'hook-xml.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+5636 INFO: Processing standard module hook 'hook-_ctypes.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+5972 INFO: Processing pre-safe-import-module hook 'hook-typing_extensions.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+5973 INFO: SetuptoolsInfo: initializing cached setuptools info...
+8687 INFO: Processing standard module hook 'hook-platform.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+8849 INFO: Processing standard module hook 'hook-difflib.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+9019 INFO: Processing standard module hook 'hook-websockets.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+9641 INFO: Processing standard module hook 'hook-anyio.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+10384 INFO: Processing standard module hook 'hook-pydantic.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+10890 INFO: Processing standard module hook 'hook-rich.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+11389 INFO: Processing standard module hook 'hook-pygments.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+13061 INFO: Processing standard module hook 'hook-sysconfig.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+13238 INFO: Processing standard module hook 'hook-zoneinfo.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+14303 INFO: Processing pre-safe-import-module hook 'hook-platformdirs.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+14309 INFO: Processing standard module hook 'hook-platformdirs.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+14437 INFO: Processing standard module hook 'hook-certifi.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+14671 INFO: Processing standard module hook 'hook-imageio_ffmpeg.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+14696 INFO: Processing standard module hook 'hook-sqlite3.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+14935 INFO: Analyzing hidden import 'imageio_ffmpeg.binaries'
+14935 INFO: Analyzing hidden import 'uvicorn.__main__'
+14936 INFO: Analyzing hidden import 'uvicorn.lifespan'
+14936 INFO: Analyzing hidden import 'uvicorn.lifespan.off'
+14937 INFO: Analyzing hidden import 'uvicorn.lifespan.on'
+14940 INFO: Analyzing hidden import 'uvicorn.loops'
+14940 INFO: Analyzing hidden import 'uvicorn.loops.asyncio'
+14941 INFO: Analyzing hidden import 'uvicorn.loops.auto'
+14943 INFO: Analyzing hidden import 'uvicorn.protocols.http.auto'
+14944 INFO: Analyzing hidden import 'uvicorn.protocols.websockets.auto'
+14945 INFO: Analyzing hidden import 'uvicorn.workers'
+14948 INFO: Processing module hooks (post-graph stage)...
+15056 INFO: Processing pre-safe-import-module hook 'hook-packaging.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+17287 INFO: Processing pre-safe-import-module hook 'hook-tomli.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+17287 INFO: Setuptools: 'tomli' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.tomli'!
+17293 INFO: Processing standard module hook 'hook-setuptools.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+17301 INFO: Processing pre-safe-import-module hook 'hook-distutils.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+17301 INFO: Processing pre-find-module-path hook 'hook-distutils.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_find_module_path'
+17545 INFO: Processing standard module hook 'hook-distutils.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+17558 INFO: Processing standard module hook 'hook-distutils.util.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+17582 INFO: Processing standard module hook 'hook-_osx_support.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+17796 INFO: Processing pre-safe-import-module hook 'hook-jaraco.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+17796 INFO: Setuptools: 'jaraco' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.jaraco'!
+17804 INFO: Processing standard module hook 'hook-setuptools._vendor.jaraco.text.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+17807 INFO: Processing pre-safe-import-module hook 'hook-importlib_resources.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+17812 INFO: Processing pre-safe-import-module hook 'hook-more_itertools.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+17813 INFO: Setuptools: 'more_itertools' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.more_itertools'!
+17883 INFO: Processing pre-safe-import-module hook 'hook-backports.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+17884 INFO: Setuptools: 'backports' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.backports'!
+18044 INFO: Processing pre-safe-import-module hook 'hook-importlib_metadata.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18045 INFO: Setuptools: 'importlib_metadata' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.importlib_metadata'!
+18059 INFO: Processing standard module hook 'hook-setuptools._vendor.importlib_metadata.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+18061 INFO: Processing pre-safe-import-module hook 'hook-zipp.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18062 INFO: Setuptools: 'zipp' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.zipp'!
+18511 INFO: Processing standard module hook 'hook-pkg_resources.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+18861 INFO: Processing pre-safe-import-module hook 'hook-wheel.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+18862 INFO: Setuptools: 'wheel' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.wheel'!
+19259 WARNING: Hidden import "tzdata" not found!
+19339 INFO: Processing standard module hook 'hook-PIL.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+19443 INFO: Processing standard module hook 'hook-PIL.Image.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+19755 INFO: Processing standard module hook 'hook-xml.etree.cElementTree.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+19859 INFO: Processing standard module hook 'hook-PIL.ImageFilter.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+21956 INFO: Processing standard module hook 'hook-PIL.SpiderImagePlugin.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+21991 INFO: Performing binary vs. data reclassification (78 entries)
+21996 INFO: Looking for ctypes DLLs
+22044 INFO: Analyzing run-time hooks ...
+22092 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+22094 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+22095 INFO: Including run-time hook 'pyi_rth_multiprocessing.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+22096 INFO: Including run-time hook 'pyi_rth_setuptools.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+22097 INFO: Including run-time hook 'pyi_rth_pkgres.py' from 'D:\\zcodeproject\\minipic\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+22115 INFO: Creating base_library.zip...
+22133 INFO: Looking for dynamic libraries
+22984 INFO: Extra DLL search directories (AddDllDirectory): []
+22984 INFO: Extra DLL search directories (PATH): []
+23448 INFO: Warnings written to D:\zcodeproject\minipic\build\MiniCopy\warn-MiniCopy.txt
+23546 INFO: Graph cross-reference written to D:\zcodeproject\minipic\build\MiniCopy\xref-MiniCopy.html
+23577 INFO: checking PYZ
+23577 INFO: Building PYZ because PYZ-00.toc is non existent
+23577 INFO: Building PYZ (ZlibArchive) D:\zcodeproject\minipic\build\MiniCopy\PYZ-00.pyz
+24407 INFO: Building PYZ (ZlibArchive) D:\zcodeproject\minipic\build\MiniCopy\PYZ-00.pyz completed successfully.
+24424 INFO: checking PKG
+24424 INFO: Building PKG because PKG-00.toc is non existent
+24424 INFO: Building PKG (CArchive) MiniCopy.pkg
+24447 INFO: Building PKG (CArchive) MiniCopy.pkg completed successfully.
+24448 INFO: Bootloader D:\zcodeproject\minipic\.venv\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel\run.exe
+24448 INFO: checking EXE
+24448 INFO: Building EXE because EXE-00.toc is non existent
+24448 INFO: Building EXE from EXE-00.toc
+24448 INFO: Copying bootloader EXE to D:\zcodeproject\minipic\build\MiniCopy\MiniCopy.exe
+24481 INFO: Copying icon to EXE
+24514 INFO: Copying 0 resources to EXE
+24514 INFO: Embedding manifest in EXE
+24542 INFO: Appending PKG archive to EXE
+24584 INFO: Fixing EXE headers
+24741 INFO: Building EXE from EXE-00.toc completed successfully.
+24744 INFO: checking COLLECT
+24744 INFO: Building COLLECT because COLLECT-00.toc is non existent
+24744 INFO: Removing dir D:\zcodeproject\minipic\dist\MiniCopy
+24790 INFO: Building COLLECT COLLECT-00.toc
+25036 INFO: Building COLLECT COLLECT-00.toc completed successfully.
+25039 INFO: Build complete! The results are available in: D:\zcodeproject\minipic\dist
+
+=== ��� ===
+����·����dist\MiniCopy\MiniCopy.exe
+��ԴĿ¼��dist\MiniCopy\_internal\
+˫�� MiniCopy.exe ������� Web UI���˿� 7860���Զ������������

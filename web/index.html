@@ -734,7 +734,7 @@ a:hover { color: #7fe0ff; }
 </aside>
 </div><!-- /layout -->
 
-  <footer class="page-footer">MiniCopy · MiniMax H3 本地 UI</footer>
+  <footer class="page-footer">MiniCopy · MiniMax H3 本地 UI · <span id="footer-ver"></span></footer>
 
 <script>
 const BASE = '/api';
@@ -1115,6 +1115,8 @@ async function loadConfigStatus() {
     const res = await fetch(BASE + '/config');
     if (!res.ok) return;
     const cfg = await res.json();
+    // v0.2.2+: surface server version in the page footer
+    if (cfg.version) $('footer-ver').textContent = 'v' + cfg.version;
     // Build modelConstraints map
     modelConstraints = {};
     cfg.models.forEach(function(m) {

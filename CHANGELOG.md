@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.2] - 2026-09-02
+
+### Added
+- **页脚显示服务端版本号**：Web UI 页脚追加版本号（`<span id="footer-ver">`，由 `loadConfigStatus()` 在 `GET /api/config` 成功后写入 `v<version>`）；`/api/config` 返回新增 `version` 字段。
+- **版本号单一来源收拢到 `minipic.__version__`**：`src/minipic/__init__.py` 的 `__version__` 升为 `0.2.2`；`pyproject.toml` 删掉静态 `version` 行，改为 `dynamic = ["version"]` + `[tool.setuptools.dynamic] version = { attr = "minipic.__version__" }`，避免下次再出双源不同步。
+
 ## [0.2.1] - 2026-09-02
 
 ### Fixed

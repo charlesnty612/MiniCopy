@@ -47,6 +47,7 @@ from .storage import (
     list_tasks,
     update_task,
 )
+from minipic import __version__
 
 log = logging.getLogger(__name__)
 
@@ -314,6 +315,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                 for name in API_MODELS
             ],
             "model_default": "MiniMax-H3",
+            "version": __version__,
         }
 
     # -------------------------------------------------------- POST /api/config
