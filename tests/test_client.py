@@ -12,9 +12,9 @@ import pytest
 
 from minipic.client import (
     EP_CREATE_VIDEO,
-    EP_FILE_RETRIEVE,
     EP_QUERY_VIDEO,
     EP_UPLOAD,
+    MM_FILE_PREFIX,
     MiniMaxClient,
     _guess_mime,
 )
@@ -298,47 +298,24 @@ class TestUploadFile:
 # --------------------------------------------------------------------------- resolve_file_url
 class TestResolveFileUrl:
     @pytest.mark.asyncio
-    async def test_resolve_url_from_download_url_field(self) -> None:
-        def handler(req: httpx.Request) -> httpx.Response:
-            assert req.url.params["file_id"] == "fid-1"
-            return ok_response({"file": {"download_url": "https://cdn.x/file"}})
-
+    async def test_returns_mm_file_url_for_file_id(self) -> None:
+        # V2 content[] accepts mm_file://{file_id} — no network round trip.
         c = MiniMaxClient(Config(api_key="k"))
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(base_url="https://x", transport=transport) as http:
-            c._client = http
-            url = await c.resolve_file_url("fid-1")
-        assert url == "https://cdn.x/file"
+        url = await c.resolve_file_url("fid-1")
+        assert url == f"{MM_FILE_PREFIX}fid-1"
 
     @pytest.mark.asyncio
-    async def test_resolve_url_from_url_field(self) -> None:
-        def handler(req: httpx.Request) -> httpx.Response:
-            return ok_response({"file": {"url": "https://cdn.y/file"}})
-
+    async def test_returns_mm_file_url_for_numeric_file_id(self) -> None:
+        # Real file_ids from the V1 upload API are numeric.
         c = MiniMaxClient(Config(api_key="k"))
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(base_url="https://x", transport=transport) as http:
-            c._client = http
-            url = await c.resolve_file_url("fid-1")
-        assert url == "https://cdn.y/file"
-
-    @pytest.mark.asyncio
-    async def test_resolve_url_raises_on_missing_url(self) -> None:
-        def handler(req: httpx.Request) -> httpx.Response:
-            return ok_response({"file": {}})
-
-        c = MiniMaxClient(Config(api_key="k"))
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(base_url="https://x", transport=transport) as http:
-            c._client = http
-            with pytest.raises(ConfigError, match="missing URL"):
-                await c.resolve_file_url("fid-1")
+        url = await c.resolve_file_url("437131811713442")
+        assert url == f"{MM_FILE_PREFIX}437131811713442"
 
 
 # --------------------------------------------------------------------------- upload_and_resolve
 class TestUploadAndResolve:
     @pytest.mark.asyncio
-    async def test_upload_and_resolve_chains_calls(self, tmp_path: Path) -> None:
+    async def test_upload_then_mm_file_url(self, tmp_path: Path) -> None:
         video = tmp_path / "v.mp4"
         video.write_bytes(b"x")
 
@@ -346,18 +323,16 @@ class TestUploadAndResolve:
 
         def handler(req: httpx.Request) -> httpx.Response:
             call_seq.append(req.url.path)
-            if "upload" in req.url.path:
-                return ok_response({"file": {"file_id": "fid"}})
-            return ok_response({"file": {"download_url": "https://cdn/file"}})
+            return ok_response({"file": {"file_id": "fid-42"}})
 
         c = MiniMaxClient(Config(api_key="k"))
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(base_url="https://x", transport=transport) as http:
             c._client = http
             url = await c.upload_and_resolve(video)
-        assert url == "https://cdn/file"
-        assert EP_UPLOAD in call_seq[0]
-        assert EP_FILE_RETRIEVE in call_seq[1]
+        assert url == f"{MM_FILE_PREFIX}fid-42"
+        # Only the upload endpoint is hit — no retrieve round trip.
+        assert call_seq == [EP_UPLOAD]
 
 
 # --------------------------------------------------------------------------- create_video_task
@@ -508,6 +483,55 @@ class TestDownloadVideo:
 class TestEndpoints:
     def test_endpoints_are_defined(self) -> None:
         assert EP_UPLOAD == "/v1/files/upload"
-        assert EP_FILE_RETRIEVE == "/v1/files/retrieve"
+        assert MM_FILE_PREFIX == "mm_file://"
         assert EP_CREATE_VIDEO == "/v2/video_generation"
         assert EP_QUERY_VIDEO == "/v2/query/video_generation/{task_id}"
+
+
+# --------------------------------------------------------------------------- Context-IR defaults
+class TestContextIRDefaults:
+    """Context-IR defaults & timeout behaviour — no real network calls."""
+
+    def test_fetch_context_ir_prompt_default_max_wait_is_90s(self) -> None:
+        """v0.2.0+: cap the IR poll at 90s (the service is documented to finish
+        in under a minute; longer waits block the real submission)."""
+        import inspect
+        from minipic.client import MiniMaxClient
+        sig = inspect.signature(MiniMaxClient.fetch_context_ir_prompt)
+        assert sig.parameters["max_wait_seconds"].default == 90.0
+
+    @pytest.mark.asyncio
+    async def test_fetch_context_ir_prompt_timeout_raises_config_error(self) -> None:
+        """When the IR task never reaches a terminal state within
+        ``max_wait_seconds``, raise ConfigError (callers handle as fallback)."""
+        from minipic.client import MiniMaxClient
+        from minipic.errors import ConfigError
+
+        c = MiniMaxClient(Config(api_key="k"))
+
+        async def fake_query(task_id: str) -> dict[str, Any]:
+            return {"status": "Processing"}  # never terminal
+        c.query_video_task = fake_query  # type: ignore[assignment]
+
+        # Tiny interval + tiny max_wait so the test finishes quickly.
+        c.cfg.poll_interval_seconds = 0.01
+        with pytest.raises(ConfigError, match="timed out"):
+            await c.fetch_context_ir_prompt("ir-tid", max_wait_seconds=0.05)
+
+    def test_create_context_ir_task_rejects_non_h3_model(self) -> None:
+        """create_context_ir_task only supports MiniMax-H3 — H3-Max / others
+        raise ConfigError, matching the Web layer's behaviour."""
+        from minipic.client import MiniMaxClient
+        from minipic.errors import ConfigError
+
+        c = MiniMaxClient(Config(api_key="k"))
+        with pytest.raises(ConfigError, match="only supports MiniMax-H3"):
+            # We never call .create — the check is synchronous.
+            # Use asyncio.run to drive the underlying async method.
+            import asyncio
+            asyncio.run(c.create_context_ir_task(
+                model="MiniMax-H3-Max",
+                content=[{"type": "text", "text": "x"}],
+                duration=10,
+                ratio="adaptive",
+            ))

@@ -26,3 +26,12 @@ htmlcov/
 # Dist
 dist/
 build/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Internal working notes / session artifacts (not for publishing)
+HANDOFF-*.md
+.zcode/
+image_001.jpg

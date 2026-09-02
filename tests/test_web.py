@@ -25,11 +25,10 @@ from minipic.errors import (
     MiniPicError,
     TaskError,
 )
-from minipic.storage import TaskRecord, get_prepare, get_task
+from minipic.storage import TaskRecord, get_task
 from minipic.web import (
     CreateBody,
     _detect_key_source,
-    _maybe_enhance_prompt,
     _record_to_dict,
     _submit_task,
     _validate_mode,
@@ -39,10 +38,26 @@ from minipic.web import (
 
 # --------------------------------------------------------------------------- shared fixtures
 @pytest.fixture
-def web_cfg(sample_config: Config, tmp_path: Path) -> Config:
-    """A valid Config pointing videos_dir at a tmp path (so downloads don't pollute)."""
+def web_cfg(sample_config: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
+    """A valid Config pointing videos_dir at a tmp path (so downloads don't pollute).
+
+    v0.2.0+: also writes the api_key to the isolated user config file so
+    ``GET /api/config`` (which only reads the user config) reports
+    ``has_key=True, source="user"``. Without this, the UI would see an
+    unconfigured state on every test even though ``sample_config`` carries a
+    key in memory.
+    """
     cfg = sample_config
     cfg.videos_dir = str(tmp_path / "videos")
+    # The conftest's autouse fixture already isolates _user_config_path to a
+    # tmp path; reuse it so the web UI sees the same key as the in-memory cfg.
+    import minipic.config as config_mod
+    user_path = config_mod._user_config_path()
+    user_path.parent.mkdir(parents=True, exist_ok=True)
+    user_path.write_text(
+        json.dumps({"api_key": cfg.api_key, "base_url": cfg.base_url}),
+        encoding="utf-8",
+    )
     return cfg
 
 
@@ -69,14 +84,12 @@ class _FakeMiniMaxClient:
             return_value={"status": "Success", "content": [{"url": "https://cdn/v.mp4"}]}
         )
         self.upload_and_resolve = AsyncMock(return_value="https://cdn/uploaded")
-        # Context-IR defaults: rewrite to a 6-section-style prompt
-        self.create_context_ir_task = AsyncMock(return_value="ir-task-default")
-        self.fetch_context_ir_prompt = AsyncMock(
-            return_value=(
-                "{\"role\":\"a girl\",\"action\":\"walking\",\"scene\":\"park\","
-                "\"shot\":\"medium\",\"motion\":\"smooth\",\"audio\":\"ambient\"}"
-            )
-        )
+        # Context-IR defaults: return an empty enhanced prompt so the IR
+        # branch in _submit_task is exercised but doesn't actually rewrite
+        # (used_context_ir stays False). Tests that want the rewrite path
+        # override ``fetch_context_ir_prompt.return_value``.
+        self.create_context_ir_task = AsyncMock(return_value="ir-tid-default")
+        self.fetch_context_ir_prompt = AsyncMock(return_value="")
 
         async def _dl(url: str, dest: Path, **kwargs: Any) -> None:
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -195,7 +208,8 @@ class TestApiCreateModeValidation:
             "ref_images": [{"path": "/x.jpg", "role": "reference_image"}],
         })
         assert resp.status_code == 400
-        assert "first_frame" in resp.json()["detail"]
+        # i2v 角色检查已统一通过 validate_model_modes；H3 不接受 reference_image 作为 i2v 角色。
+        assert "reference_image" in resp.json()["detail"]
 
     def test_i2v_rejects_reference_videos(self, web_client: TestClient) -> None:
         resp = web_client.post("/api/create", json={
@@ -325,6 +339,61 @@ class TestApiListTasks:
         data = resp.json()
         assert any(t["task_id"] == "tid-list-1" for t in data)
 
+    def test_list_refreshes_non_terminal_tasks(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """Bug 1 fix: GET /api/tasks now refreshes non-terminal rows in-place.
+
+        Previously the list endpoint was a pure SQLite read; tasks stuck in
+        'submitted' / 'Processing' never moved. After the fix the list
+        triggers the same per-task refresh as /api/tasks/{id}, but only for
+        non-terminal records (so we don't hammer MiniMax for completed jobs).
+        """
+        from minipic.storage import insert_task
+        now = int(time.time() * 1000)
+        insert_task(TaskRecord(
+            task_id="tid-list-live", mode="t2v", prompt_excerpt="p",
+            status="Processing", submitted_at=now,
+        ))
+        insert_task(TaskRecord(
+            task_id="tid-list-done", mode="t2v", prompt_excerpt="p",
+            status="Success", submitted_at=now - 1,
+        ))
+        fake = fake_client_factory()
+        # Different statuses per task — verify the refresh path actually runs.
+        async def _fake_query(tid: str) -> dict[str, Any]:
+            if tid == "tid-list-live":
+                return {"status": "Success", "content": []}
+            raise AssertionError(f"unexpected refresh of terminal task {tid}")
+        fake.query_video_task.side_effect = _fake_query
+
+        resp = web_client.get("/api/tasks")
+        assert resp.status_code == 200
+        data = resp.json()
+        live = next(t for t in data if t["task_id"] == "tid-list-live")
+        done = next(t for t in data if t["task_id"] == "tid-list-done")
+        # Live: refreshed to Success; terminal: untouched.
+        assert live["status"] == "Success"
+        assert live["api_status"] == "Success"
+        assert done["status"] == "Success"
+        assert "api_status" not in done
+
+    def test_list_swallows_refresh_errors(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """Refresh failure on the list endpoint must NOT 500 — graceful degrade."""
+        from minipic.storage import insert_task
+        insert_task(TaskRecord(
+            task_id="tid-list-boom", mode="t2v", prompt_excerpt="p",
+            status="Processing",
+        ))
+        fake = fake_client_factory()
+        fake.query_video_task.side_effect = RuntimeError("net down")
+        resp = web_client.get("/api/tasks")
+        assert resp.status_code == 200
+        # Local snapshot is still returned.
+        assert any(t["task_id"] == "tid-list-boom" for t in resp.json())
+
 
 # --------------------------------------------------------------------------- GET /api/tasks/{task_id}
 class TestApiGetTask:
@@ -388,6 +457,53 @@ class TestApiGetTask:
         resp = web_client.get("/api/tasks/tid-swallow")
         assert resp.status_code == 200
 
+    def test_submitted_status_refreshes_from_api(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """Bug 1 fix: 'submitted' is NOT terminal — must trigger API refresh.
+
+        Previously the impl excluded 'submitted' from the refresh branch by
+        mistake (it was in the 'terminal' skip-list). The page therefore
+        always showed 'submitted' even when MiniMax had long moved the task
+        on to Processing / Success.
+        """
+        from minipic.storage import insert_task, get_task
+        insert_task(TaskRecord(
+            task_id="tid-sub-refresh", mode="t2v", prompt_excerpt="p",
+            status="submitted",
+        ))
+        fake = fake_client_factory()
+        fake.query_video_task.return_value = {
+            "status": "Processing",
+            "content": [],
+        }
+        resp = web_client.get("/api/tasks/tid-sub-refresh")
+        assert resp.status_code == 200
+        data = resp.json()
+        # Refreshed status is reflected in the response and persisted.
+        assert data["api_status"] == "Processing"
+        assert data["status"] == "Processing"
+        rec = get_task("tid-sub-refresh")
+        assert rec is not None
+        assert rec.status == "Processing"
+
+    def test_all_terminal_states_skip_refresh(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """Success / Failed / Cancelled / Expired → no MiniMax round-trip."""
+        from minipic.storage import insert_task
+        for terminal in ("Success", "Failed", "Cancelled", "Expired"):
+            tid = f"tid-term-{terminal.lower()}"
+            insert_task(TaskRecord(
+                task_id=tid, mode="t2v", prompt_excerpt="p", status=terminal,
+            ))
+            fake = fake_client_factory()
+            fake.query_video_task.return_value = {"status": "ShouldNotRun"}
+            resp = web_client.get(f"/api/tasks/{tid}")
+            assert resp.status_code == 200
+            # query_video_task must NEVER be called for terminal records.
+            assert fake.query_video_task.await_count == 0, terminal
+
 
 # --------------------------------------------------------------------------- POST /api/tasks/{task_id}/download
 class TestApiDownloadTask:
@@ -395,14 +511,27 @@ class TestApiDownloadTask:
         resp = web_client.post("/api/tasks/missing/download")
         assert resp.status_code == 404
 
-    def test_404_when_file_not_on_disk(self, web_client: TestClient) -> None:
+    def test_409_when_task_not_completed(
+        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On-demand download: local file missing + API says not finished → 409."""
         from minipic.storage import insert_task
         insert_task(TaskRecord(
-            task_id="tid-no-file", mode="t2v", prompt_excerpt="p", status="Success",
-            output_path="/nope.mp4",
+            task_id="tid-no-file", mode="t2v", prompt_excerpt="p", status="Processing",
+            output_path=None,
         ))
+
+        class _FakeClient:
+            def __init__(self, cfg): self.cfg = cfg
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+            async def query_video_task(self, tid):
+                return {"status": "Processing"}
+
+        import minipic.web as web_mod
+        monkeypatch.setattr(web_mod, "MiniMaxClient", _FakeClient)
         resp = web_client.post("/api/tasks/tid-no-file/download")
-        assert resp.status_code == 404
+        assert resp.status_code == 409
 
     def test_serves_mp4(
         self, web_client: TestClient, web_cfg: Config
@@ -420,6 +549,35 @@ class TestApiDownloadTask:
         assert resp.status_code == 200
         assert resp.headers.get("content-type") == "video/mp4"
         assert resp.content == b"abc"
+
+    def test_on_demand_download_fetches_from_api(
+        self, web_client: TestClient, web_cfg: Config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Local file missing + task succeeded → download from MiniMax on demand."""
+        from minipic.storage import insert_task
+        insert_task(TaskRecord(
+            task_id="tid-ondemand", mode="t2v", prompt_excerpt="p", status="succeeded",
+            output_path=None,
+        ))
+
+        class _FakeClient:
+            def __init__(self, cfg): self.cfg = cfg
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return None
+            async def query_video_task(self, tid):
+                return {"status": "succeeded", "content": {"url": "https://cdn/v.mp4"}}
+            async def download_video(self, url, dest):
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"ondemand-mp4")
+
+        import minipic.web as web_mod
+        monkeypatch.setattr(web_mod, "MiniMaxClient", _FakeClient)
+        resp = web_client.post("/api/tasks/tid-ondemand/download")
+        assert resp.status_code == 200
+        assert resp.headers.get("content-type") == "video/mp4"
+        assert resp.content == b"ondemand-mp4"
+        # File should now exist locally for subsequent requests.
+        assert (Path(web_cfg.videos_dir) / "tid-ondemand.mp4").is_file()
 
 
 # --------------------------------------------------------------------------- CreateBody pydantic model
@@ -489,10 +647,13 @@ class TestValidateMode:
         from fastapi import HTTPException
         body = self._body(
             mode="i2v",
+            ratio=None,
             ref_images=[{"path": "/a.jpg", "role": "reference_image"}],
         )
-        with pytest.raises(HTTPException):
+        with pytest.raises(HTTPException) as ei:
             _validate_mode(body)
+        # H3 不接受 reference_image 作为 i2v 角色（首帧/中间帧/尾帧 之外）
+        assert "reference_image" in ei.value.detail
 
     def test_i2v_first_frame_ok(self) -> None:
         body = self._body(
@@ -516,7 +677,7 @@ class TestSubmitTask:
         client = MagicMock()
         client.create_video_task = AsyncMock(return_value="tid-1")
 
-        task_id, content = await _submit_task(client, body)
+        task_id, content, _used_ir = await _submit_task(client, body)
         assert task_id == "tid-1"
         assert content[0] == {"type": "text", "text": body.prompt}
         # The call kwargs should include ratio + duration
@@ -534,7 +695,7 @@ class TestSubmitTask:
         client = MagicMock()
         client.create_video_task = AsyncMock(return_value="tid-i2v")
 
-        task_id, content = await _submit_task(client, body)
+        task_id, content, _used_ir = await _submit_task(client, body)
         assert task_id == "tid-i2v"
         kwargs = client.create_video_task.await_args.kwargs
         assert kwargs["ratio"] == "adaptive"
@@ -549,10 +710,10 @@ class TestSubmitTask:
         client = MagicMock()
         client.create_video_task = AsyncMock(return_value="tid-1")
 
-        _, content = await _submit_task(client, body)
+        _, content, _used_ir = await _submit_task(client, body)
         img_items = [c for c in content if c.get("type") == "image_url"]
         assert len(img_items) == 1
-        assert img_items[0]["url"] == "https://example.com/photo.jpg"
+        assert img_items[0]["image_url"]["url"] == "https://example.com/photo.jpg"
         assert img_items[0]["role"] == "first_frame"
 
     @pytest.mark.asyncio
@@ -572,12 +733,12 @@ class TestSubmitTask:
         # Patch resolve_reference so it doesn't need a real client
         async def fake_resolve(client: Any, source: Any) -> str:
             return "https://cdn/uploaded.jpg"
-        monkeypatch.setattr("minipic.web.resolve_reference", fake_resolve)
+        monkeypatch.setattr("minipic.media.resolve_reference", fake_resolve)
 
-        _, content = await _submit_task(client, body)
+        _, content, _used_ir = await _submit_task(client, body)
         img_items = [c for c in content if c.get("type") == "image_url"]
         assert len(img_items) == 1
-        assert img_items[0]["url"] == "https://cdn/uploaded.jpg"
+        assert img_items[0]["image_url"]["url"] == "https://cdn/uploaded.jpg"
 
     @pytest.mark.asyncio
     async def test_audio_url_included(self) -> None:
@@ -588,15 +749,21 @@ class TestSubmitTask:
         )
         client = MagicMock()
         client.create_video_task = AsyncMock(return_value="tid-1")
-        _, content = await _submit_task(client, body)
+        _, content, _used_ir = await _submit_task(client, body)
         audio_items = [c for c in content if c.get("type") == "audio_url"]
         assert len(audio_items) == 1
-        assert audio_items[0]["url"] == "https://cdn/sound.mp3"
+        assert audio_items[0]["audio_url"]["url"] == "https://cdn/sound.mp3"
 
     @pytest.mark.asyncio
-    async def test_video_clips_emit_one_item_per_clip(
+    async def test_reference_video_emits_single_video_item(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """A single ref video (≤15s) becomes exactly one video_url content item.
+
+        v0.1.5+: multi-segment generation was removed, so even a long-ish
+        reference video at this stage emits only one content entry. Long
+        references are rejected earlier by prepare_reference_video.
+        """
         from minipic.media import VideoClip
 
         video = tmp_path / "v.mp4"
@@ -606,26 +773,282 @@ class TestSubmitTask:
             ref_videos=[{"path": str(video)}],
         )
 
-        # prepare_reference_video returns 2 clips
-        async def fake_prep(source: Any, *, clips_spec: Any = None) -> list[VideoClip]:
-            return [
-                VideoClip(path=source, start_seconds=0.0, duration_seconds=5.0, is_split=False),
-                VideoClip(path=source, start_seconds=5.0, duration_seconds=5.0, is_split=True),
-            ]
-        monkeypatch.setattr("minipic.web.prepare_reference_video", fake_prep)
+        # prepare_reference_video returns a single-element list
+        async def fake_prep(source: Any) -> list[VideoClip]:
+            return [VideoClip(path=source, start_seconds=0.0, duration_seconds=5.0, is_split=False)]
+        monkeypatch.setattr("minipic.media.prepare_reference_video", fake_prep)
 
         async def fake_resolve(client: Any, source: Any) -> str:
             return f"https://cdn/{Path(source).name}"
-        monkeypatch.setattr("minipic.web.resolve_reference", fake_resolve)
+        monkeypatch.setattr("minipic.media.resolve_reference", fake_resolve)
 
         client = MagicMock()
         client.create_video_task = AsyncMock(return_value="tid-1")
 
-        _, content = await _submit_task(client, body)
+        _, content, _used_ir = await _submit_task(client, body)
         video_items = [c for c in content if c.get("type") == "video_url"]
-        assert len(video_items) == 2
-        # Each should carry the duration
-        assert all("duration" in c for c in video_items)
+        assert len(video_items) == 1
+        # The clip carries its duration for H3's payload
+        assert "duration" in video_items[0]
+        assert video_items[0]["duration"] == 5.0
+
+    @pytest.mark.asyncio
+    async def test_long_ref_video_surfaces_media_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A >15s reference video raises MediaError that propagates to the caller."""
+        from minipic.errors import MediaError
+        from minipic.media import VideoClip
+
+        video = tmp_path / "long.mp4"
+        video.write_bytes(b"x")
+        body = CreateBody(
+            mode="r2v", prompt="x",
+            ref_videos=[{"path": str(video)}],
+        )
+
+        async def fake_prep_long(source: Any) -> list[VideoClip]:
+            raise MediaError(
+                "参考视频 17.8s 超过 H3 上限 15s，多段生成已移除，"
+                "请先用 ffmpeg 截取到 ≤15s 再重试"
+            )
+        monkeypatch.setattr("minipic.media.prepare_reference_video", fake_prep_long)
+
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-1")
+
+        with pytest.raises(MediaError, match="超过 H3 上限 15s"):
+            await _submit_task(client, body)
+        # Should not have been called since validation failed before submit
+        assert client.create_video_task.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_long_ref_audio_surfaces_media_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A >15s reference audio raises MediaError that propagates to the caller.
+
+        v0.1.6+ audio cap matches V2 docs: ≤15s per clip, no multi-segment.
+        """
+        from minipic.errors import MediaError
+        from minipic.media import AudioClip
+
+        audio = tmp_path / "long.mp3"
+        audio.write_bytes(b"x")
+        body = CreateBody(
+            mode="r2v", prompt="x",
+            ref_audios=[{"path": str(audio)}],
+        )
+
+        async def fake_prep_audio_long(source: Any) -> list[AudioClip]:
+            raise MediaError(
+                "音频参考 20.0s 超过 H3 上限 15s，请先用 ffmpeg 截取到 ≤15s 再重试"
+            )
+        monkeypatch.setattr("minipic.media.prepare_reference_audio", fake_prep_audio_long)
+
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-1")
+
+        with pytest.raises(MediaError, match="音频参考"):
+            await _submit_task(client, body)
+        assert client.create_video_task.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_short_ref_audio_passes_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ≤15s local audio becomes a single audio_url content item with duration."""
+        from minipic.media import AudioClip
+
+        audio = tmp_path / "ok.mp3"
+        audio.write_bytes(b"x")
+        body = CreateBody(
+            mode="r2v", prompt="x",
+            ref_audios=[{"path": str(audio)}],
+        )
+
+        async def fake_prep_audio(source: Any) -> list[AudioClip]:
+            return [AudioClip(path=source, start_seconds=0.0, duration_seconds=8.0, is_split=False)]
+        monkeypatch.setattr("minipic.media.prepare_reference_audio", fake_prep_audio)
+
+        async def fake_resolve(client: Any, source: Any) -> str:
+            return f"https://cdn/{Path(source).name}"
+        monkeypatch.setattr("minipic.media.resolve_reference", fake_resolve)
+
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-1")
+
+        _, content, _used_ir = await _submit_task(client, body)
+        audios = [c for c in content if c.get("type") == "audio_url"]
+        assert len(audios) == 1
+        assert audios[0]["duration"] == 8.0
+
+
+# --------------------------------------------------------------------------- _submit_task — Context-IR wiring (Bug 2 fix)
+class TestSubmitTaskContextIR:
+    """Bug 2: H3-Context-IR was wired up in client.py but never called.
+
+    Web submissions now optionally call create_context_ir_task +
+    fetch_context_ir_prompt to rewrite the brief into the structured H3
+    prompt before the real generation submit. Failures fall back silently.
+    """
+
+    @pytest.mark.asyncio
+    async def test_h3_default_uses_context_ir(self) -> None:
+        """use_context_ir=True (default) + H3 → IR rewrites content[0].text."""
+        body = CreateBody(mode="t2v", prompt="a cat", ratio="16:9")
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-ir-1")
+        # Snapshot what IR was called with BEFORE the swap happens.
+        ir_content_seen: list[list[dict[str, Any]]] = []
+
+        async def _ir_capture(**kw: Any) -> str:
+            # Deep-copy so the later in-place mutation doesn't taint our snapshot.
+            ir_content_seen.append([dict(item) for item in kw["content"]])
+            return "ir-tid"
+        client.create_context_ir_task = AsyncMock(side_effect=_ir_capture)
+        client.fetch_context_ir_prompt = AsyncMock(
+            return_value="[REWRITTEN 6-SECTION PROMPT]"
+        )
+
+        task_id, content, used_ir = await _submit_task(client, body)
+        assert task_id == "tid-ir-1"
+        assert used_ir is True
+        assert content[0]["text"] == "[REWRITTEN 6-SECTION PROMPT]"
+        # The IR task was created with the original prompt (snapshot proves it).
+        assert len(ir_content_seen) == 1
+        assert ir_content_seen[0][0]["text"] == "a cat"
+        # And the final submit went through with the rewritten prompt.
+        final_kw = client.create_video_task.await_args.kwargs
+        assert final_kw["content"][0]["text"] == "[REWRITTEN 6-SECTION PROMPT]"
+
+    @pytest.mark.asyncio
+    async def test_use_context_ir_false_skips_ir(self) -> None:
+        """use_context_ir=False → no IR calls, original prompt submitted."""
+        body = CreateBody(mode="t2v", prompt="hello", ratio="16:9",
+                          use_context_ir=False)
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-no-ir")
+        client.create_context_ir_task = AsyncMock()
+        client.fetch_context_ir_prompt = AsyncMock()
+
+        _, content, used_ir = await _submit_task(client, body)
+        assert used_ir is False
+        assert content[0]["text"] == "hello"
+        client.create_context_ir_task.assert_not_called()
+        client.fetch_context_ir_prompt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_h3_max_skips_context_ir(self) -> None:
+        """H3-Max is unsupported by IR — silently skip, do NOT raise."""
+        body = CreateBody(
+            mode="t2v", prompt="hi", ratio="16:9",
+            model="MiniMax-H3-Max", resolution="768P", duration=5,
+        )
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-max-no-ir")
+        # Simulate the client's own ConfigError guard for H3-Max.
+        async def _ir_create(**_kw: Any) -> str:
+            raise ConfigError("unsupported model: 'MiniMax-H3-Max' (H3-Context-IR only supports MiniMax-H3)")
+        client.create_context_ir_task = AsyncMock(side_effect=_ir_create)
+        client.fetch_context_ir_prompt = AsyncMock()
+
+        task_id, content, used_ir = await _submit_task(client, body)
+        assert task_id == "tid-max-no-ir"
+        assert used_ir is False
+        # Original prompt is preserved, no IR fetches.
+        assert content[0]["text"] == "hi"
+        client.fetch_context_ir_prompt.assert_not_called()
+        # Final submit went through with H3-Max.
+        assert client.create_video_task.await_args.kwargs["model"] == "MiniMax-H3-Max"
+
+    @pytest.mark.asyncio
+    async def test_context_ir_failure_falls_back_silently(self) -> None:
+        """Any IR exception (timeout / network / etc.) → fallback to original prompt."""
+        body = CreateBody(mode="t2v", prompt="original", ratio="16:9")
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-fb")
+        client.create_context_ir_task = AsyncMock(return_value="ir-tid")
+        client.fetch_context_ir_prompt = AsyncMock(
+            side_effect=TimeoutError("context-ir timed out")
+        )
+
+        # Must NOT raise — graceful degradation.
+        task_id, content, used_ir = await _submit_task(client, body)
+        assert task_id == "tid-fb"
+        assert used_ir is False
+        # Original prompt survives.
+        assert content[0]["text"] == "original"
+        # And the final submit still went through.
+        assert client.create_video_task.await_args.kwargs["content"][0]["text"] == "original"
+
+    @pytest.mark.asyncio
+    async def test_context_ir_empty_response_keeps_original(self) -> None:
+        """If the IR endpoint returns empty/None, leave the prompt alone."""
+        body = CreateBody(mode="t2v", prompt="keep me", ratio="16:9")
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-empty")
+        client.create_context_ir_task = AsyncMock(return_value="ir-tid")
+        client.fetch_context_ir_prompt = AsyncMock(return_value="")
+
+        _, content, used_ir = await _submit_task(client, body)
+        assert used_ir is False
+        assert content[0]["text"] == "keep me"
+
+
+# --------------------------------------------------------------------------- /api/create — Context-IR end-to-end
+class TestApiCreateContextIRPersisted:
+    """The returned (task_id, content, used_context_ir) flag must reach the DB."""
+
+    def test_used_context_ir_persisted_in_extra(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        fake = fake_client_factory()
+        fake.create_video_task.return_value = "tid-ir-e2e"
+        # IR succeeds with a real rewrite.
+        fake.create_context_ir_task.return_value = "ir-tid-e2e"
+        fake.fetch_context_ir_prompt.return_value = "[ENHANCED]"
+
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "raw", "ratio": "16:9",
+            "resolution": "768P",
+        })
+        assert resp.status_code == 200, resp.text
+
+        # The submitted task's extra["used_context_ir"] is True.
+        from minipic.storage import get_task
+        rec = get_task("tid-ir-e2e")
+        assert rec is not None
+        assert rec.extra.get("used_context_ir") is True
+
+    def test_use_context_ir_false_does_not_set_flag(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        fake = fake_client_factory()
+        fake.create_video_task.return_value = "tid-no-ir-e2e"
+
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "raw", "ratio": "16:9",
+            "resolution": "768P", "use_context_ir": False,
+        })
+        assert resp.status_code == 200, resp.text
+        from minipic.storage import get_task
+        rec = get_task("tid-no-ir-e2e")
+        assert rec is not None
+        # No IR used → extra is empty (no used_context_ir key).
+        assert "used_context_ir" not in rec.extra
+
+
+# --------------------------------------------------------------------------- CreateBody pydantic — use_context_ir
+class TestCreateBodyContextIR:
+    def test_use_context_ir_default_true(self) -> None:
+        b = CreateBody(mode="t2v", prompt="x", ratio="16:9")
+        assert b.use_context_ir is True
+
+    def test_use_context_ir_explicit_false(self) -> None:
+        b = CreateBody(mode="t2v", prompt="x", ratio="16:9",
+                       use_context_ir=False)
+        assert b.use_context_ir is False
 
 
 # --------------------------------------------------------------------------- _record_to_dict
@@ -771,6 +1194,119 @@ class TestApiConfigEndpoints:
         })
         assert resp.status_code == 200, resp.text
 
+    def test_post_with_env_set_reports_user_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """env set + POST /api/config writes user file → /api/config source is 'user'."""
+        monkeypatch.setenv("MINIMAX_API_KEY", "from-env")
+        target = tmp_path / "user_cfg_dir" / "config.json"
+        import minipic.config as config_mod
+        import minipic.web as web_mod
+        monkeypatch.setattr(config_mod, "_user_config_path", lambda: target)
+        monkeypatch.setattr(web_mod, "_user_config_path", lambda: target)
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+
+        cfg = Config(api_key="from-env")
+        cfg.videos_dir = str(tmp_path / "videos")
+        app = create_app(cfg)
+        client = TestClient(app)
+
+        # After build, /api/config should report 'user' once user file has the key
+        resp = client.post("/api/config", json={"api_key": "new-user-key-9999"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["source"] == "user"
+        # GET /api/config also reports user
+        resp = client.get("/api/config")
+        assert resp.status_code == 200
+        assert resp.json()["source"] == "user"
+
+    def test_first_launch_env_set_ui_unconfigured(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.2.0+ acceptance: env set + no user config file → /api/config
+        reports has_key=False, source='none'. The Web UI is the user-facing
+        surface and only knows about keys saved through it; env/local keys
+        belong to the CLI developer workflow and must not bleed into the UI.
+        """
+        monkeypatch.setenv("MINIMAX_API_KEY", "from-env")
+        # Conftest already isolates user config to an empty tmp file; no need
+        # to write anything. Make sure cwd has no config.json either.
+        empty = tmp_path / "empty_cwd"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+
+        cfg = Config(api_key="from-env")  # load_config would have picked env
+        cfg.videos_dir = str(tmp_path / "videos")
+        app = create_app(cfg)
+        client = TestClient(app)
+
+        resp = client.get("/api/config")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["has_key"] is False
+        assert data["masked"] == ""
+        assert data["source"] == "none"
+
+    def test_ui_save_then_user_source(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.2.0+ acceptance: env set + POST /api/config saves → GET reports
+        has_key=True, source='user'. Mirrors the user journey: first launch
+        with env key sees 'unconfigured', saving through the UI flips it to
+        'user', and the env var is no longer the source."""
+        monkeypatch.setenv("MINIMAX_API_KEY", "from-env")
+        empty = tmp_path / "empty_cwd"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+
+        cfg = Config(api_key=None)  # even with no in-memory key
+        cfg.videos_dir = str(tmp_path / "videos")
+        app = create_app(cfg)
+        client = TestClient(app)
+
+        # Pre-save: unconfigured.
+        resp = client.get("/api/config")
+        assert resp.json()["source"] == "none"
+
+        # Save a key through the UI.
+        resp = client.post("/api/config", json={"api_key": "user-saved-9999"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["source"] == "user"
+
+        # Now GET reflects the saved key.
+        resp = client.get("/api/config")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["has_key"] is True
+        assert data["masked"] == "...9999"
+        assert data["source"] == "user"
+
+    def test_ui_save_writes_user_file_cli_reads_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.2.0+ acceptance: POST /api/config → user config file is updated
+        → a subsequent ``config.load_config()`` call returns the new key. This
+        is the contract that makes 'UI change, CLI sees it' work without a
+        restart."""
+        empty = tmp_path / "empty_cwd"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+
+        cfg = Config(api_key=None)
+        cfg.videos_dir = str(tmp_path / "videos")
+        app = create_app(cfg)
+        client = TestClient(app)
+
+        resp = client.post("/api/config", json={"api_key": "cli-sync-key-42"})
+        assert resp.status_code == 200, resp.text
+
+        # CLI side: load_config() must see the key saved by the UI.
+        from minipic.config import load_config
+        cli_cfg = load_config()
+        assert cli_cfg.api_key == "cli-sync-key-42"
+
 
 # --------------------------------------------------------------------------- _detect_key_source
 class TestDetectKeySource:
@@ -837,6 +1373,33 @@ class TestDetectKeySource:
         )
         assert _detect_key_source(Config()) == "none"
 
+    def test_user_wins_over_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """env set + user file has key → user (UI-saved key overrides env)."""
+        monkeypatch.setenv("MINIMAX_API_KEY", "from-env")
+        user_path = tmp_path / "user_dir" / "config.json"
+        user_path.parent.mkdir(parents=True, exist_ok=True)
+        user_path.write_text(json.dumps({"api_key": "user-key"}), encoding="utf-8")
+        import minipic.config as config_mod
+        import minipic.web as web_mod
+        monkeypatch.setattr(config_mod, "_user_config_path", lambda: user_path)
+        monkeypatch.setattr(web_mod, "_user_config_path", lambda: user_path)
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+        assert _detect_key_source(Config(api_key="user-key")) == "user"
+
+    def test_local_wins_over_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """env set + cwd config.json has key → local (file wins over env)."""
+        monkeypatch.setenv("MINIMAX_API_KEY", "from-env")
+        local = tmp_path / "config.json"
+        local.write_text(json.dumps({"api_key": "local-key"}), encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        assert _detect_key_source(Config(api_key="local-key")) == "local"
+
 
 # --------------------------------------------------------------------------- POST /api/create — model validation
 class TestApiCreateModelValidation:
@@ -888,6 +1451,177 @@ class TestApiCreateModelValidation:
         kwargs = fake.create_video_task.await_args.kwargs
         assert kwargs["model"] == "MiniMax-H3"
 
+    def test_h3_max_rejects_r2v(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """H3-Max + r2v → 400，明确提示不支持多模态参考。"""
+        resp = web_client.post("/api/create", json={
+            "mode": "r2v", "prompt": "x", "resolution": "768P",
+            "model": "MiniMax-H3-Max",
+            "ref_images": [{"path": "/a.jpg", "role": "reference_image"}],
+        })
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "MiniMax-H3-Max" in detail
+        assert "r2v" in detail
+        assert "不支持多模态参考" in detail
+
+    def test_h3_accepts_r2v(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """H3 + r2v 应当通过校验（即使 ref 含 r2v 不允许的 role 也至少过 mode 校验）。"""
+        fake = fake_client_factory()
+        fake.create_video_task.return_value = "tid-h3-r2v"
+        resp = web_client.post("/api/create", json={
+            "mode": "r2v", "prompt": "x", "resolution": "768P",
+            "model": "MiniMax-H3",
+            "ref_images": [{"path": "https://cdn/a.jpg", "role": "reference_image"}],
+        })
+        assert resp.status_code == 200, resp.text
+
+    def test_h3_max_rejects_middle_frame(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """H3-Max 不支持 i2v 中间帧。"""
+        resp = web_client.post("/api/create", json={
+            "mode": "i2v", "prompt": "x", "resolution": "768P",
+            "model": "MiniMax-H3-Max",
+            "ref_images": [{"path": "https://cdn/a.jpg", "role": "middle_frame"}],
+        })
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "middle_frame" in detail
+
+    def test_h3_rejects_middle_frame(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """v0.1.6+：官方 V2 API schema 的 role 枚举不含 middle_frame，
+        H3 也已收紧为首/尾帧两角色；中间帧应被拒绝。"""
+        resp = web_client.post("/api/create", json={
+            "mode": "i2v", "prompt": "x", "resolution": "768P",
+            "model": "MiniMax-H3",
+            "ref_images": [{"path": "https://cdn/a.jpg", "role": "middle_frame"}],
+        })
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "middle_frame" in detail
+
+    def test_i2v_first_and_last_frame_combo(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """i2v 首+尾帧组合：两张图，一张 role=first_frame、一张 role=last_frame。"""
+        fake = fake_client_factory()
+        fake.create_video_task.return_value = "tid-i2v-double"
+        resp = web_client.post("/api/create", json={
+            "mode": "i2v", "prompt": "x", "resolution": "768P",
+            "model": "MiniMax-H3",
+            "ref_images": [
+                {"path": "https://cdn/first.jpg", "role": "first_frame"},
+                {"path": "https://cdn/last.jpg", "role": "last_frame"},
+            ],
+        })
+        assert resp.status_code == 200, resp.text
+
+    def test_i2v_two_same_role_rejected(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """i2v 两张图不能同角色（必须是 first + last）。"""
+        resp = web_client.post("/api/create", json={
+            "mode": "i2v", "prompt": "x", "resolution": "768P",
+            "model": "MiniMax-H3",
+            "ref_images": [
+                {"path": "https://cdn/a.jpg", "role": "first_frame"},
+                {"path": "https://cdn/b.jpg", "role": "first_frame"},
+            ],
+        })
+        assert resp.status_code == 400
+        assert "first_frame" in resp.json()["detail"]
+
+    def test_r2v_rejects_first_frame_role(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """r2v 不接受 first_frame 角色（图生视频与多模态参考互斥）。"""
+        resp = web_client.post("/api/create", json={
+            "mode": "r2v", "prompt": "x", "resolution": "768P",
+            "model": "MiniMax-H3",
+            "ref_images": [{"path": "https://cdn/a.jpg", "role": "first_frame"}],
+        })
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert "互斥" in detail or "reference_image" in detail
+
+    def test_prompt_over_7000_chars_rejected(
+        self, web_client: TestClient
+    ) -> None:
+        """text 超过 7000 字符 → 400。"""
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "a" * 7001, "ratio": "16:9",
+            "resolution": "768P",
+        })
+        assert resp.status_code == 400
+        assert "7000" in resp.json()["detail"]
+
+    def test_ref_images_over_9_rejected(
+        self, web_client: TestClient
+    ) -> None:
+        """ref_images 超过 9 张 → 400。"""
+        refs = [{"path": f"https://cdn/{i}.jpg", "role": "reference_image"}
+                for i in range(10)]
+        resp = web_client.post("/api/create", json={
+            "mode": "r2v", "prompt": "x", "resolution": "768P",
+            "model": "MiniMax-H3",
+            "ref_images": refs,
+        })
+        assert resp.status_code == 400
+        assert "9" in resp.json()["detail"]
+
+    def test_duplicate_first_frame_rejected(
+        self, web_client: TestClient
+    ) -> None:
+        """多张图共享 first_frame 角色 → 400（每角色至多 1 张）。"""
+        resp = web_client.post("/api/create", json={
+            "mode": "r2v", "prompt": "x", "resolution": "768P",
+            "model": "MiniMax-H3",
+            "ref_images": [
+                {"path": "https://cdn/a.jpg", "role": "first_frame"},
+                {"path": "https://cdn/b.jpg", "role": "first_frame"},
+            ],
+        })
+        assert resp.status_code == 400
+        assert "first_frame" in resp.json()["detail"]
+
+    def test_h3_max_accepts_first_and_last_frame(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """H3-Max 支持 i2v 首帧/尾帧。"""
+        for role in ("first_frame", "last_frame"):
+            fake = fake_client_factory()
+            fake.create_video_task.return_value = f"tid-{role}"
+            resp = web_client.post("/api/create", json={
+                "mode": "i2v", "prompt": "x", "resolution": "768P",
+                "model": "MiniMax-H3-Max",
+                "ref_images": [{"path": "https://cdn/a.jpg", "role": role}],
+            })
+            assert resp.status_code == 200, resp.text
+
+
+# --------------------------------------------------------------------------- /api/config exposes mode/role capabilities
+class TestApiConfigModeCapabilities:
+    def test_models_include_modes_and_i2v_roles(
+        self, web_client: TestClient
+    ) -> None:
+        resp = web_client.get("/api/config")
+        data = resp.json()
+        for m in data["models"]:
+            assert "modes" in m
+            assert "i2v_roles" in m
+        h3 = next(m for m in data["models"] if m["name"] == "MiniMax-H3")
+        h3m = next(m for m in data["models"] if m["name"] == "MiniMax-H3-Max")
+        assert h3["modes"] == ["t2v", "i2v", "r2v"]
+        assert h3["i2v_roles"] == ["first_frame", "last_frame"]
+        assert h3m["modes"] == ["t2v", "i2v"]
+        assert h3m["i2v_roles"] == ["first_frame", "last_frame"]
+
 
 # --------------------------------------------------------------------------- _submit_task — model field passthrough
 class TestSubmitTaskModel:
@@ -912,430 +1646,8 @@ class TestSubmitTaskModel:
         assert kwargs["model"] == "MiniMax-H3-Max"
 
 
-# ============================================================ v0.1.3b /api/prepare
-class TestApiPrepareAuth:
-    def test_503_when_no_api_key(self, tmp_path: Path) -> None:
-        cfg = Config(api_key=None)
-        cfg.videos_dir = str(tmp_path / "videos")
-        app = create_app(cfg)
-        client = TestClient(app)
-        resp = client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "hi", "ratio": "16:9",
-        })
-        assert resp.status_code == 503
-
-
-class TestApiPrepareModeValidation:
-    def test_t2v_rejects_adaptive_ratio(self, web_client: TestClient) -> None:
-        resp = web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "hi", "ratio": "adaptive",
-        })
-        assert resp.status_code == 400
-        assert "adaptive" in resp.json()["detail"].lower()
-
-    def test_r2v_requires_reference(self, web_client: TestClient) -> None:
-        resp = web_client.post("/api/prepare", json={
-            "mode": "r2v", "prompt": "hi",
-        })
-        assert resp.status_code == 400
-        assert "reference" in resp.json()["detail"].lower()
-
-
-# ============================================================ v0.1.7 ConfigError → 400
-class TestApiPrepareConfigError:
-    """When _build_plan raises ConfigError (e.g. H3 rejects the upload with
-    2013 'invalid params'), the endpoint must surface it as 400 with a
-    readable detail — not 500 with HTML body. TokenPlan keys hit this path."""
-
-    def test_prepare_400_when_build_plan_raises_config_error(
-        self, web_client: TestClient, monkeypatch: pytest.MonkeyPatch,
-        tmp_file
-    ) -> None:
-        """When client.upload_file raises ConfigError (H3 2013), prepare must
-        surface it as 400 + readable hint, not 500 HTML."""
-        from minipic.errors import ConfigError
-        import minipic.web as web_mod
-
-        # 1. Bypass ffprobe (fake file would fail probing).
-        monkeypatch.setattr(web_mod, "ffprobe_duration", lambda _p: 10.0)
-        # 2. Bypass the H3 upload + resolve step; raise the real ConfigError
-        #    that a TokenPlan key would get from H3 (2013 invalid file purpose).
-        async def _raise_upload(*_args, **_kwargs):
-            raise ConfigError(
-                "upload response missing file_id: "
-                "{'file': None, 'base_resp': {'status_code': 2013, "
-                "'status_msg': 'invalid params, invalid file purpose'}}"
-            )
-        monkeypatch.setattr(web_mod, "resolve_reference", _raise_upload)
-
-        ref = tmp_file("ref.mp4", b"\x00" * 100)
-        resp = web_client.post("/api/prepare", json={
-            "mode": "r2v", "prompt": "hi",
-            "model": "MiniMax-H3", "duration": 5, "resolution": "768P",
-            "ref_videos": [{"path": str(ref)}],
-        })
-        assert resp.status_code == 400, resp.text
-        detail = resp.json()["detail"]
-        assert "2013" in detail
-        # Hint about pay-as-you-go / TokenPlan should appear.
-        assert "pay-as-you-go" in detail.lower() or "tokenplan" in detail.lower()
-
-
-class TestApiPrepareHappyPath:
-    def test_t2v_returns_plan_without_h3_submit(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake = fake_client_factory()
-        resp = web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "a cat", "ratio": "16:9",
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["prepare_id"].startswith("prep-")
-        assert data["estimated_segments"] == 1
-        # No H3 submit should have happened during prepare
-        assert fake.create_video_task.await_count == 0
-
-    def test_persists_prepare_record(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake_client_factory()
-        resp = web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "x", "ratio": "16:9",
-        })
-        prepare_id = resp.json()["prepare_id"]
-        rec = get_prepare(prepare_id)
-        assert rec is not None
-        assert rec.payload["prompt"] == "x"
-        assert rec.status == "prepared"
-
-    def test_short_ref_video_no_split(
-        self, web_client: TestClient, fake_client_factory, monkeypatch
-    ) -> None:
-        """A 5s reference video stays as a single clip."""
-        fake = fake_client_factory()
-        import minipic.media as media_mod
-        from minipic.media import SegmentSpec
-        # Patch the helpers so we don't need real ffmpeg or a real file
-        monkeypatch.setattr("minipic.web.ffprobe_duration", lambda p: 5.0)
-        # Source needs to exist for the existence check
-        import tempfile as _tf
-        with _tf.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
-            tf.write(b"f")
-            src_path = tf.name
-        resp = web_client.post("/api/prepare", json={
-            "mode": "r2v", "prompt": "x", "resolution": "768P",
-            "ref_videos": [{"path": src_path}],
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["estimated_segments"] == 1
-        assert data["segments"] == []
-        assert fake.create_video_task.await_count == 0
-
-    def test_long_ref_video_triggers_multi_segment(
-        self, web_client: TestClient, fake_client_factory, monkeypatch, tmp_path: Path
-    ) -> None:
-        """A 17.77s reference video gets split into 2 segments."""
-        fake_client_factory()
-        # Stub plan_segments to return 2 segments without calling ffmpeg
-        from minipic.media import SegmentSpec
-        segments = [
-            SegmentSpec(start_seconds=0.0, duration_seconds=7),
-            SegmentSpec(start_seconds=7.0, duration_seconds=11),
-        ]
-        async def fake_extract(source, segs):
-            out_dir = tmp_path / "clips" / source.stem
-            out_dir.mkdir(parents=True, exist_ok=True)
-            paths = [
-                out_dir / f"clip_{i:02d}_t{int(s.start_seconds):04d}_d{int(s.duration_seconds):04d}.mp4"
-                for i, s in enumerate(segs)
-            ]
-            for p in paths:
-                p.write_bytes(b"clip")
-            return paths
-        monkeypatch.setattr("minipic.web.ffprobe_duration", lambda p: 17.77)
-        monkeypatch.setattr("minipic.web.find_shot_boundaries", lambda p: [7.03, 12.0])
-        monkeypatch.setattr("minipic.web.plan_segments", lambda d, b: segments)
-        monkeypatch.setattr("minipic.web.extract_reference_clips", fake_extract)
-
-        src = tmp_path / "long.mp4"
-        src.write_bytes(b"f")
-        resp = web_client.post("/api/prepare", json={
-            "mode": "r2v", "prompt": "x", "resolution": "768P",
-            "ref_videos": [{"path": str(src)}],
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["estimated_segments"] == 2
-        assert len(data["segments"]) == 2
-
-    def test_too_long_ref_video_returns_400(
-        self, web_client: TestClient, fake_client_factory, monkeypatch
-    ) -> None:
-        """A 70s reference video exceeds the 4-segment cap."""
-        fake_client_factory()
-        monkeypatch.setattr("minipic.web.ffprobe_duration", lambda p: 70.0)
-        import tempfile as _tf
-        with _tf.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
-            tf.write(b"f")
-            src_path = tf.name
-        resp = web_client.post("/api/prepare", json={
-            "mode": "r2v", "prompt": "x", "resolution": "768P",
-            "ref_videos": [{"path": src_path}],
-        })
-        assert resp.status_code == 400
-        assert "max 4" in resp.json()["detail"] or "would need" in resp.json()["detail"]
-
-    def test_missing_ref_video_returns_400(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake_client_factory()
-        resp = web_client.post("/api/prepare", json={
-            "mode": "r2v", "prompt": "x", "resolution": "768P",
-            "ref_videos": [{"path": "/no/such/file.mp4"}],
-        })
-        assert resp.status_code == 400
-        assert "not found" in resp.json()["detail"]
-
-    def test_url_ref_video_appended_as_is(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        """URL ref_videos can't be split — they go in as-is."""
-        fake_client_factory()
-        resp = web_client.post("/api/prepare", json={
-            "mode": "r2v", "prompt": "x", "resolution": "768P",
-            "ref_videos": [{"path": "https://cdn.example.com/v.mp4"}],
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        # No multi-segment splitting for URLs
-        assert data["segments"] == []
-        content = data["content_preview"]
-        assert any(c.get("url") == "https://cdn.example.com/v.mp4"
-                   for c in content if isinstance(c, dict))
-
-
-class TestApiPrepareContextIr:
-    def test_default_uses_context_ir(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake = fake_client_factory()
-        web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "natural brief", "ratio": "16:9",
-        })
-        assert fake.create_context_ir_task.await_count == 1
-
-    def test_enhanced_prompt_returned_on_success(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake = fake_client_factory()
-        fake.fetch_context_ir_prompt.return_value = "rewritten 6-section prompt"
-        resp = web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "natural brief", "ratio": "16:9",
-        })
-        data = resp.json()
-        assert data["enhanced_prompt"] == "rewritten 6-section prompt"
-        assert data["used_context_ir"] is True
-        assert data["context_ir_fallback"] is False
-        assert data["context_ir_error"] is None
-        assert data["original_prompt"] == "natural brief"
-
-    def test_use_context_ir_false_skips_call(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake = fake_client_factory()
-        resp = web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "x", "ratio": "16:9",
-            "use_context_ir": False,
-        })
-        data = resp.json()
-        assert fake.create_context_ir_task.await_count == 0
-        assert data["used_context_ir"] is False
-        assert data["context_ir_fallback"] is False
-        # enhanced == original since IR was not attempted
-        assert data["enhanced_prompt"] == "x"
-        assert data["original_prompt"] == "x"
-
-    def test_context_ir_failure_falls_back(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        from minipic.errors import ConfigError
-        fake = fake_client_factory()
-        fake.create_context_ir_task.side_effect = ConfigError(
-            "[2013] TokenPlan does not support MiniMax-H3-Context-IR"
-        )
-        resp = web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "natural brief", "ratio": "16:9",
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["used_context_ir"] is False
-        assert data["context_ir_fallback"] is True
-        assert data["context_ir_error"] is not None
-        assert "2013" in data["context_ir_error"]
-        # enhanced_prompt == original (the fallback)
-        assert data["enhanced_prompt"] == "natural brief"
-        # Warning added
-        assert any("Context-IR" in w for w in data["warnings"])
-
-    def test_enhanced_prompt_in_content_preview(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake = fake_client_factory()
-        fake.fetch_context_ir_prompt.return_value = "REWRITTEN"
-        resp = web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "original", "ratio": "16:9",
-        })
-        content = resp.json()["content_preview"]
-        # First text element should be the enhanced prompt
-        assert content[0]["text"] == "REWRITTEN"
-
-
-# ============================================================ v0.1.3b /api/prepare/{id}
-class TestApiGetPrepare:
-    def test_404_for_missing(self, web_client: TestClient) -> None:
-        resp = web_client.get("/api/prepare/nope")
-        assert resp.status_code == 404
-
-    def test_returns_plan(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake_client_factory()
-        r1 = web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "x", "ratio": "16:9",
-        })
-        prepare_id = r1.json()["prepare_id"]
-        r2 = web_client.get(f"/api/prepare/{prepare_id}")
-        assert r2.status_code == 200
-        data = r2.json()
-        assert data["prepare_id"] == prepare_id
-        assert data["status"] == "prepared"
-        assert "content_preview" in data
-
-    def test_410_for_expired(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        from minipic.storage import PrepareRecord, insert_prepare
-        fake_client_factory()
-        # Insert with expires_at in the past
-        rec = PrepareRecord(
-            prepare_id="prep-stale",
-            payload={"prompt": "x", "mode": "t2v", "ratio": "16:9"},
-            plan={"content": [], "segments": [], "warnings": []},
-            expires_at=10,  # long ago
-        )
-        insert_prepare(rec)
-        r = web_client.get("/api/prepare/prep-stale")
-        assert r.status_code == 410
-        assert "expired" in r.json()["detail"].lower()
-
-    def test_410_for_already_committed(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        from minipic.storage import PrepareRecord, insert_prepare
-        fake_client_factory()
-        rec = PrepareRecord(
-            prepare_id="prep-committed",
-            payload={"prompt": "x", "mode": "t2v", "ratio": "16:9"},
-            plan={"content": [], "segments": [], "warnings": []},
-            status="committed",
-        )
-        insert_prepare(rec)
-        r = web_client.get("/api/prepare/prep-committed")
-        assert r.status_code == 410
-        assert "committed" in r.json()["detail"].lower()
-
-
-# ============================================================ v0.1.3b /api/commit/{id}
-class TestApiCommit:
-    def test_404_for_missing(self, web_client: TestClient) -> None:
-        resp = web_client.post("/api/commit/nope")
-        assert resp.status_code == 404
-
-    def test_410_for_expired(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        from minipic.storage import PrepareRecord, insert_prepare
-        fake_client_factory()
-        rec = PrepareRecord(
-            prepare_id="prep-x",
-            payload={"prompt": "x", "mode": "t2v", "ratio": "16:9"},
-            plan={"content": [], "segments": [], "warnings": []},
-            expires_at=10,
-        )
-        insert_prepare(rec)
-        resp = web_client.post("/api/commit/prep-x")
-        assert resp.status_code == 410
-
-    def test_single_segment_task_creates_one_child(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake = fake_client_factory()
-        # No segments → 1 child
-        r1 = web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "x", "ratio": "16:9",
-        })
-        prepare_id = r1.json()["prepare_id"]
-        r2 = web_client.post(f"/api/commit/{prepare_id}")
-        assert r2.status_code == 200
-        data = r2.json()
-        assert data["task_id"].startswith("task-")
-        # Eventually 1 H3 call happens (via the background task)
-        # We don't wait for it in this test; just check the parent exists
-        parent = get_task(data["task_id"])
-        assert parent is not None
-        assert parent.mode == "multi"
-        assert parent.extra["prepare_id"] == prepare_id
-
-    def test_multi_segment_plan_creates_n_children(
-        self, web_client: TestClient, fake_client_factory, monkeypatch, tmp_path: Path
-    ) -> None:
-        fake = fake_client_factory()
-        from minipic.media import SegmentSpec
-        segments = [
-            SegmentSpec(start_seconds=0.0, duration_seconds=7),
-            SegmentSpec(start_seconds=7.0, duration_seconds=11),
-        ]
-        async def fake_extract(source, segs):
-            out_dir = tmp_path / "clips" / source.stem
-            out_dir.mkdir(parents=True, exist_ok=True)
-            paths = [
-                out_dir / f"clip_{i:02d}_t{int(s.start_seconds):04d}_d{int(s.duration_seconds):04d}.mp4"
-                for i, s in enumerate(segs)
-            ]
-            for p in paths:
-                p.write_bytes(b"clip")
-            return paths
-        monkeypatch.setattr("minipic.web.ffprobe_duration", lambda p: 17.77)
-        monkeypatch.setattr("minipic.web.find_shot_boundaries", lambda p: [7.03, 12.0])
-        monkeypatch.setattr("minipic.web.plan_segments", lambda d, b: segments)
-        monkeypatch.setattr("minipic.web.extract_reference_clips", fake_extract)
-
-        src = tmp_path / "long.mp4"
-        src.write_bytes(b"f")
-        r1 = web_client.post("/api/prepare", json={
-            "mode": "r2v", "prompt": "x", "resolution": "768P",
-            "ref_videos": [{"path": str(src)}],
-        })
-        assert r1.status_code == 200
-        prepare_id = r1.json()["prepare_id"]
-        assert len(r1.json()["segments"]) == 2
-        # Mark prepare as committed by the commit handler
-        r2 = web_client.post(f"/api/commit/{prepare_id}")
-        assert r2.status_code == 200
-        # Background task started — give it a moment
-        import time as _t
-        _t.sleep(0.5)
-        # Fake.create_video_task should have been called twice (2 children)
-        # for multi-segment; we tolerate 1 or 2 due to scheduling
-        assert fake.create_video_task.await_count >= 1
-        parent = get_task(r2.json()["task_id"])
-        assert parent is not None
-
-
-# ============================================================ v0.1.3b /api/create legacy
-class TestApiCreateLegacy:
+# ============================================================ /api/create single entry point
+class TestApiCreateSingleEntry:
     def test_still_works(
         self, web_client: TestClient, fake_client_factory
     ) -> None:
@@ -1346,18 +1658,6 @@ class TestApiCreateLegacy:
         })
         assert resp.status_code == 200
         assert resp.json()["task_id"] == "tid-legacy"
-
-    def test_deprecation_header_present(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake_client_factory()
-        resp = web_client.post("/api/create", json={
-            "mode": "t2v", "prompt": "x", "ratio": "16:9",
-        })
-        # FastAPI's deprecated=True adds the deprecation headers
-        # Note: we don't assert on a specific header value because the
-        # version of FastAPI may emit different ones.
-        assert resp.status_code == 200
 
 
 # ============================================================ v0.1.4 /api/upload
@@ -1515,6 +1815,91 @@ class TestApiUpload:
         assert resp.json()["kind"] == "audio"
         assert resp.json()["content_type"] == "audio/mpeg"
 
+    def test_upload_image_accepts_heic(
+        self, web_client: TestClient
+    ) -> None:
+        """HEIC 与 HEIF 已加入 image allow-list，对齐 V2 文档。"""
+        # HEIC body content is irrelevant for the MIME allow-list check.
+        resp = web_client.post(
+            "/api/upload",
+            files={"file": ("photo.heic", b"\x00" * 32, "image/heic")},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["kind"] == "image"
+        assert data["content_type"] == "image/heic"
+        assert Path(data["path"]).suffix == ".heic"
+
+    def test_upload_image_accepts_heif(
+        self, web_client: TestClient
+    ) -> None:
+        resp = web_client.post(
+            "/api/upload",
+            files={"file": ("photo.heif", b"\x00" * 32, "image/heif")},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["kind"] == "image"
+        assert data["content_type"] == "image/heif"
+
+    def test_upload_image_over_30mb_rejected(
+        self, web_client: TestClient
+    ) -> None:
+        """图片 >30MB (per-kind cap) → 400。"""
+        from minipic.web import MAX_IMAGE_BYTES
+        # Use a Content-Length within global cap so pre-flight passes;
+        # the streaming guard then enforces the per-kind 30MB cap.
+        boundary = "----minipicboundaryabcdef0123456789"
+        head = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="big.png"\r\n'
+            f"Content-Type: image/png\r\n\r\n"
+        ).encode()
+        tail = f"\r\n--{boundary}--\r\n".encode()
+        # 31MB body, fake CL small so pre-flight passes; streaming guard catches.
+        padding = b"x" * (31 * 1024 * 1024)
+        body = head + padding + tail
+        resp = web_client.post(
+            "/api/upload",
+            content=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(head) + 100),
+            },
+        )
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert str(MAX_IMAGE_BYTES) in detail
+        assert "image" in detail
+
+    def test_upload_audio_over_15mb_rejected(
+        self, web_client: TestClient
+    ) -> None:
+        """音频 >15MB (per-kind cap) → 400。"""
+        from minipic.web import MAX_AUDIO_BYTES
+        boundary = "----minipicboundaryabcdef0123456789"
+        head = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="big.mp3"\r\n'
+            f"Content-Type: audio/mpeg\r\n\r\n"
+        ).encode()
+        tail = f"\r\n--{boundary}--\r\n".encode()
+        # 16MB body
+        padding = b"x" * (16 * 1024 * 1024)
+        body = head + padding + tail
+        resp = web_client.post(
+            "/api/upload",
+            content=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(head) + 100),
+            },
+        )
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert str(MAX_AUDIO_BYTES) in detail
+        assert "audio" in detail
+
 
 # ============================================================ v0.1.5 GET /api/probe/video
 class TestApiProbeVideo:
@@ -1555,76 +1940,4 @@ class TestApiProbeVideo:
         """Empty path → 422 (FastAPI Query validation)."""
         r = web_client.get("/api/probe/video", params={"path": ""})
         assert r.status_code == 422, r.text
-
-
-# ============================================================ v0.1.3b _maybe_enhance_prompt
-class TestMaybeEnhancePrompt:
-    @pytest.mark.asyncio
-    async def test_disabled_returns_original(self) -> None:
-        body = CreateBody(mode="t2v", prompt="hello", ratio="16:9",
-                          use_context_ir=False)
-        # Pass a stub client; create_context_ir_task should not be called
-        class _Stub:
-            create_context_ir_task = AsyncMock()
-        final, used, fallback, err = await _maybe_enhance_prompt(
-            body, [{"type": "text", "text": "x"}], _Stub(), [],
-        )
-        assert final == "hello"
-        assert used is False
-        assert fallback is False
-        assert err is None
-        assert _Stub().create_context_ir_task.await_count == 0
-
-    @pytest.mark.asyncio
-    async def test_success_uses_rewrite(self) -> None:
-        body = CreateBody(mode="t2v", prompt="brief", ratio="16:9")
-        client = _FakeMiniMaxClient()
-        final, used, fallback, err = await _maybe_enhance_prompt(
-            body, [{"type": "text", "text": "x"}], client, [],
-        )
-        assert used is True
-        assert fallback is False
-        assert err is None
-        assert final == client.fetch_context_ir_prompt.return_value
-
-    @pytest.mark.asyncio
-    async def test_failure_falls_back(self) -> None:
-        from minipic.errors import ConfigError
-        body = CreateBody(mode="t2v", prompt="brief", ratio="16:9")
-        client = _FakeMiniMaxClient()
-        client.create_context_ir_task.side_effect = ConfigError("[2013] nope")
-        warnings: list[str] = []
-        final, used, fallback, err = await _maybe_enhance_prompt(
-            body, [{"type": "text", "text": "x"}], client, warnings,
-        )
-        assert used is False
-        assert fallback is True
-        assert err is not None and "2013" in err
-        assert final == "brief"  # fallback to original
-        assert len(warnings) == 1
-        assert "Context-IR" in warnings[0]
-
-
-# ============================================================ v0.1.3b /api/prepares list
-class TestApiListPrepares:
-    def test_empty_initially(
-        self, web_client: TestClient
-    ) -> None:
-        resp = web_client.get("/api/prepares")
-        assert resp.status_code == 200
-        assert resp.json() == []
-
-    def test_lists_recent(
-        self, web_client: TestClient, fake_client_factory
-    ) -> None:
-        fake_client_factory()
-        web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "x", "ratio": "16:9",
-        })
-        web_client.post("/api/prepare", json={
-            "mode": "t2v", "prompt": "y", "ratio": "16:9",
-        })
-        resp = web_client.get("/api/prepares")
-        data = resp.json()
-        assert len(data) == 2
 

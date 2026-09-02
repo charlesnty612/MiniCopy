@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.2.0] - 2026-09-01
+
+### Changed
+- **架构去重**：`cli.py` 与 `web.py` 重复的 content[] 构建逻辑抽到 `media.build_content()`（两处曾因不一致导致 Web 端提交 400）；「提取视频 URL + 下载」抽到 `media.download_task_result()`。
+- **修复 CLI text 结构 bug**：`minipic create` 的 text 项从嵌套 `{"text":{"text":...}}` 改为官方要求的扁平 `{"text":...}`（此前 CLI 提交会被官方拒绝）。
+- **CLI r2v 音频补校验**：`--ref-audio` 现在也走 `prepare_reference_audio`（≤15s），与 Web 端一致。
+
+### Removed
+- 删除死代码 `src/minipic/prompt.py`（H3Prompt 类无任何生产引用）及 `tests/test_prompt.py`。
+
+## [0.1.7] - 2026-09-01
+
+### Changed
+- **API key 优先级调整**：user config（`~/.config/minipic/config.json`）成为唯一权威，`user > local > env`；在网页 UI 里保存的 key 对所有入口（CLI + Web）生效，重启后仍有效，环境变量仅兜底。
+- **端口固定 7860**：`minipic web` 移除 `--port` 参数，`python -m minipic.web` 入口同步从 8765 改为 7860，杜绝串用其他程序端口。
+
+## [0.1.6] - 2026-09-01
+
+### Added
+- **H3-Max 能力约束落地**：H3-Max 不支持多模态参考（r2v）与中间帧；`MODEL_CONSTRAINTS` 新增 `modes` / `i2v_roles`，`validate_model_modes()` 校验；Web UI 与 CLI 提交前都拦截。
+
+### Changed
+- **对照官方文档对齐**（role 枚举无 `middle_frame`）：
+  - i2v 支持首帧 / 尾帧（含首+尾帧组合），不再支持中间帧。
+  - 图生视频与多模态参考互斥（`first_frame`/`last_frame` 与 `reference_*` 不可混用）。
+  - text ≤7000 字符、参考图 ≤9 张、首/尾帧各 ≤1。
+  - 上传按类型区分大小上限：图片 ≤30MB（补 HEIC/HEIF）、视频 ≤50MB、音频 ≤15MB。
+  - 参考音频 ≤15s 校验。
+
+### Fixed
+- `content[]` 结构按官方 schema 修正：URL 嵌套在 `image_url`/`video_url`/`audio_url` 对象内（此前 Web 端用了顶层扁平结构导致提交 400）。
+
+## [0.1.5] - 2026-09-01
+
+### Removed
+- **多段生成整体移除**：prepare/commit 流程（`/api/prepare`、`/api/commit`、`prepare`/`commit`/`prepares` CLI 命令）、`--ref-video-clips` 参数、长参考视频自动切段与拼接（`plan_segments`、`find_shot_boundaries`、`extract_reference_clips`、`concat_videos`）、`prepare_records` 存储。
+- 回到原生 ≤15s 单段 H3 生成；参考视频 >15s 直接报错提示先截取。
+
+### Changed
+- **上传 URL 引用改为 `mm_file://{file_id}`**：不再调用 `/v1/files/retrieve` 解析 CDN URL（该接口不返回 URL，是提交 400 的根因之一）。
+
 ## [0.1.4] - 2026-09-01
 
 ### Added

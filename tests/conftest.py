@@ -51,12 +51,17 @@ def _isolate_user_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Itera
 
     # Direct monkeypatch — works on Windows too.
     import minipic.config as cfg_mod
+    import minipic.web as web_mod
     fake_user_cfg = tmp_path / "user_cfg" / "config.json"
     fake_user_data = tmp_path / "user_data"
     monkeypatch.setattr(cfg_mod, "_user_config_path", lambda: fake_user_cfg)
     monkeypatch.setattr(cfg_mod, "_user_data_dir", lambda: fake_user_data)
     monkeypatch.setattr(cfg_mod, "user_data_path",
                         lambda name: _fake_user_data_path(fake_user_data, name))
+    # web.py also imports _user_config_path at module level; patch both
+    # namespaces so _detect_key_source and any other web helper see the
+    # isolated tmp path rather than the real %APPDATA%/minipic/config.json.
+    monkeypatch.setattr(web_mod, "_user_config_path", lambda: fake_user_cfg)
 
     # Strip secrets from env
     for k in ("MINIMAX_API_KEY", "MINIMAX_BASE_URL", "MINIPIC_CONFIG_PATH"):

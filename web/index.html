@@ -3,125 +3,591 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>minipic</title>
+<title>MiniCopy</title>
 <style>
+/* ===================================================== v0.4.0 — 双列 UI 改版
+   新结构：顶部 hero（logo + 标题 + Key 状态）+ 双列布局（左表单 / 右详情 + 任务列表）。
+   - id / class 全保留（与 JS / 旧测试兼容）；所有视觉靠 CSS 变量与重定义样式达成。
+   - HTML / JS 一行未动（除布局结构调整）。 */
+:root {
+  /* 层级背景 */
+  --bg-0: #060914;
+  --bg-1: #0b1220;
+  --bg-2: rgba(15, 25, 45, 0.55);
+  --bg-3: rgba(20, 32, 56, 0.75);
+  /* 文本 */
+  --fg-0: #f0f6ff;
+  --fg-1: #c2d4ec;
+  --fg-2: #859ab8;
+  --fg-3: #54688a;
+  /* 强调色 */
+  --accent: #00c8ff;
+  --accent-soft: rgba(0, 200, 255, 0.18);
+  --accent-fg: #04121e;
+  --ok: #2ee08a;
+  --ok-soft: rgba(46, 224, 138, 0.16);
+  --warn: #ffb547;
+  --warn-soft: rgba(255, 181, 71, 0.18);
+  --danger: #ff4d7e;
+  --danger-soft: rgba(255, 77, 126, 0.18);
+  /* 边框 + 发光 */
+  --border: rgba(0, 200, 255, 0.22);
+  --border-strong: rgba(0, 200, 255, 0.45);
+  --glow: 0 0 20px rgba(0, 200, 255, 0.45);
+  --glow-soft: 0 0 16px rgba(0, 200, 255, 0.22);
+  --shadow-card: 0 8px 24px rgba(0, 0, 0, 0.55), 0 0 0 1px var(--border) inset;
+  /* v0.4.0 新增：分段标题与表面 */
+  --surface-1: rgba(10, 18, 36, 0.6);
+  --surface-2: rgba(12, 22, 42, 0.72);
+}
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #f7f7f7; color: #222; line-height: 1.5; padding: 24px; }
-h1 { font-size: 1.4rem; margin-bottom: 4px; }
-h2 { font-size: 1.1rem; margin: 24px 0 8px; }
-p.sub { color: #666; font-size: 0.85rem; margin-bottom: 20px; }
 
-.card { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 16px; margin-bottom: 16px; max-width: 640px; }
+html, body { min-height: 100%; }
 
-label { display: block; font-size: 0.85rem; font-weight: 600; margin: 10px 0 4px; color: #333; }
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  background:
+    linear-gradient(180deg, rgba(6, 9, 20, 0.55) 0%, rgba(6, 9, 20, 0.75) 100%),
+    url('/assets/cyber-bg.jpg') right center / cover no-repeat,
+    var(--bg-0);
+  background-attachment: fixed;
+  color: var(--fg-1);
+  line-height: 1.55;
+  padding: 24px;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  flex-direction: column;
+}
 
-input[type=text], input[type=number], textarea, select { width: 100%; padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; font-size: 0.9rem; }
-textarea { resize: vertical; min-height: 80px; font-family: inherit; }
-input:disabled, select:disabled { background: #eee; color: #888; }
+h1 { font-size: 1.9rem; color: var(--fg-0); letter-spacing: 2px; font-weight: 700; line-height: 1.1; }
+/* 品牌后缀（-阿米巴破局者-短视频复刻工具）：小一号、弱一档，跟主名区分层级 */
+h1 .brand-suffix { font-size: 1.05rem; letter-spacing: 1px; font-weight: 600; color: var(--fg-1); margin-left: 2px; }
+h2 { font-size: 1.05rem; margin: 22px 0 10px; color: var(--fg-0); font-weight: 600; letter-spacing: 0.5px; }
+h3 { color: var(--fg-0); }
+p.sub { color: var(--fg-2); font-size: 0.85rem; margin-top: 4px; }
+
+/* ============ Hero 顶部横幅（logo + 标题 + Key 状态） */
+.hero {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  margin-bottom: 22px;
+  min-height: 150px;
+  background:
+    linear-gradient(135deg, rgba(6, 9, 20, 0.55) 0%, rgba(6, 9, 20, 0.78) 100%),
+    url('/assets/hero-banner.jpg') center / cover no-repeat,
+    var(--bg-1);
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0, 200, 255, 0.08) inset;
+  display: flex;
+  align-items: center;
+}
+.hero-inner {
+  width: 100%;
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 22px 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.brand-logo {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  object-fit: cover;
+  border: 1px solid rgba(0, 200, 255, 0.45);
+  box-shadow: 0 0 14px rgba(0, 200, 255, 0.35);
+  background: var(--surface-2);
+}
+
+/* ============ Cards（玻璃质感，全页背景下加深） */
+.card {
+  background: rgba(8, 14, 28, 0.78);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px 24px;
+  margin-bottom: 18px;
+  max-width: none;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: var(--shadow-card);
+}
+
+/* ============ Form sections (v0.4.0) — 4 个分组小标题 */
+.form-section { margin-top: 18px; }
+.form-section:first-of-type { margin-top: 14px; }
+.form-section-title {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  margin-bottom: 10px;
+  color: var(--accent);
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed rgba(0, 200, 255, 0.18);
+}
+
+/* ============ Form fields */
+label {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  margin: 12px 0 6px;
+  color: var(--fg-2);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+label:first-of-type { margin-top: 6px; }
+
+input[type=text], input[type=number], input[type=password], textarea, select {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.92rem;
+  background: rgba(8, 14, 28, 0.65);
+  color: var(--fg-0);
+  font-family: inherit;
+  transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
+}
+input[type=text]:hover, input[type=number]:hover, input[type=password]:hover,
+textarea:hover, select:hover { border-color: var(--border-strong); }
+input[type=text]:focus, input[type=number]:focus, input[type=password]:focus,
+textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  background: rgba(10, 18, 36, 0.85);
+}
+textarea { resize: vertical; min-height: 110px; line-height: 1.55; }
+input:disabled, select:disabled { background: rgba(8, 14, 28, 0.35); color: var(--fg-3); cursor: not-allowed; }
+
+::placeholder { color: var(--fg-3); }
 
 .row { display: flex; gap: 8px; align-items: flex-end; margin-top: 6px; }
 .row > * { flex: 1; }
 
-.mode-radios { display: flex; gap: 16px; margin: 8px 0; }
-.mode-radios label { font-weight: normal; margin: 0; display: flex; align-items: center; gap: 4px; cursor: pointer; }
-.mode-radios input[type=radio] { width: auto; }
+/* mode-radios 升级为分段标签卡（v0.4.0）：更大点击区域、emoji 图标、选中青色发光 */
+.mode-radios {
+  display: flex;
+  gap: 12px;
+  margin: 8px 0 6px;
+  flex-wrap: wrap;
+}
+.mode-radios label {
+  font-weight: 600;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 10px 18px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-1);
+  color: var(--fg-1);
+  text-transform: none;
+  letter-spacing: 0.3px;
+  font-size: 0.92rem;
+  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease, transform 120ms ease;
+}
+.mode-radios label:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
+  transform: translateY(-1px);
+}
+.mode-radios label .mode-icon {
+  font-size: 1.05rem;
+  line-height: 1;
+}
+.mode-radios label:has(input[type=radio]:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--fg-0);
+  box-shadow: 0 0 18px rgba(0, 200, 255, 0.45), 0 0 0 1px var(--accent) inset;
+}
+.mode-radios input[type=radio] {
+  width: auto;
+  accent-color: var(--accent);
+  margin-right: 2px;
+}
 
-.btn { padding: 7px 16px; border: 1px solid #bbb; border-radius: 4px; background: #eee; cursor: pointer; font-size: 0.85rem; }
-.btn:hover { background: #ddd; }
-.btn-primary { background: #0066cc; color: #fff; border-color: #0055aa; }
-.btn-primary:hover { background: #0055aa; }
-.btn-small { padding: 4px 10px; font-size: 0.8rem; }
-.btn-danger { background: #fff; color: #c00; border-color: #c00; }
-.btn-danger:hover { background: #fee; }
+/* ============ Buttons */
+.btn {
+  padding: 8px 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(20, 32, 56, 0.6);
+  color: var(--fg-0);
+  cursor: pointer;
+  font-size: 0.88rem;
+  font-family: inherit;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease;
+}
+.btn:hover {
+  background: rgba(28, 44, 72, 0.8);
+  border-color: var(--border-strong);
+}
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.ref-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.btn-primary {
+  background: linear-gradient(180deg, #00d4ff 0%, #00a8d8 100%);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  box-shadow: var(--glow);
+}
+.btn-primary:hover {
+  background: linear-gradient(180deg, #1addff 0%, #00b8e8 100%);
+  box-shadow: 0 0 28px rgba(0, 200, 255, 0.65);
+}
+.btn-primary:disabled {
+  background: rgba(0, 200, 255, 0.18);
+  color: var(--fg-2);
+  border-color: var(--accent-soft);
+  box-shadow: none;
+  font-weight: 500;
+}
+
+.btn-small { padding: 5px 12px; font-size: 0.82rem; border-radius: 5px; }
+
+.btn-danger {
+  background: rgba(255, 77, 126, 0.08);
+  color: var(--danger);
+  border-color: rgba(255, 77, 126, 0.5);
+}
+.btn-danger:hover {
+  background: rgba(255, 77, 126, 0.18);
+  border-color: var(--danger);
+  box-shadow: 0 0 16px rgba(255, 77, 126, 0.35);
+}
+
+/* ============ Reference rows */
+.ref-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 6px;
+  padding: 6px;
+  background: rgba(8, 14, 28, 0.4);
+  border: 1px solid rgba(0, 200, 255, 0.12);
+  border-radius: 6px;
+}
 .ref-row input[type=text] { flex: 2; }
 .ref-row select { flex: 1; min-width: 120px; }
 .ref-row .btn-small { flex: 0; white-space: nowrap; }
+.ref-row > input[type=file] { display: none !important; }
 
-.media-section { margin: 10px 0 4px; display: flex; gap: 6px; align-items: center; }
-.media-section span { font-size: 0.8rem; color: #555; }
+.media-section {
+  margin: 14px 0 6px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.media-section span {
+  font-size: 0.82rem;
+  color: var(--fg-2);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  font-weight: 600;
+}
 
+/* ============ Form message */
 #msg { margin: 8px 0; font-size: 0.9rem; }
-#msg.ok { color: #060; }
-#msg.err { color: #c00; }
+#msg.ok { color: var(--ok); }
+#msg.err { color: var(--danger); }
 
-.task-list { list-style: none; }
-.task-list li { border-bottom: 1px solid #eee; padding: 8px 0; font-size: 0.85rem; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.task-list li:last-child { border-bottom: none; }
-.task-id { font-family: monospace; font-size: 0.8rem; color: #555; }
-.task-mode { background: #e8f0ff; padding: 1px 5px; border-radius: 3px; font-size: 0.75rem; }
-.task-status { font-weight: 600; }
-.task-status.succeeded, .task-status.Success { color: #060; }
-.task-status.failed, .task-status.Failed { color: #c00; }
-.task-status.Queuing, .task-status.Processing, .task-status.Pending { color: #a60; }
-.ts { color: #999; font-size: 0.75rem; }
+/* ============ Task list */
+.task-list { list-style: none; padding: 0; margin: 0; }
+.task-list li {
+  padding: 12px 14px;
+  margin-bottom: 6px;
+  font-size: 0.88rem;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  background: rgba(8, 14, 28, 0.5);
+  border: 1px solid rgba(0, 200, 255, 0.14);
+  border-radius: 8px;
+  border-left: 3px solid var(--fg-3);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.task-list li:hover {
+  border-color: rgba(0, 200, 255, 0.32);
+  background: rgba(12, 20, 38, 0.65);
+}
+.task-id {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.78rem;
+  color: var(--fg-2);
+}
+.task-mode {
+  background: rgba(0, 200, 255, 0.10);
+  color: var(--accent);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  border: 1px solid rgba(0, 200, 255, 0.25);
+}
+.task-status {
+  font-weight: 600;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  letter-spacing: 0.4px;
+  border: 1px solid transparent;
+}
+.task-status.succeeded, .task-status.Success {
+  background: var(--ok-soft); color: var(--ok); border-color: rgba(46, 224, 138, 0.4);
+}
+.task-list li:has(.task-status.succeeded), .task-list li:has(.task-status.Success) { border-left-color: var(--ok); }
+.task-status.failed, .task-status.Failed {
+  background: var(--danger-soft); color: var(--danger); border-color: rgba(255, 77, 126, 0.4);
+}
+.task-list li:has(.task-status.failed), .task-list li:has(.task-status.Failed) { border-left-color: var(--danger); }
+.task-status.Queuing, .task-status.Processing, .task-status.Pending {
+  background: var(--warn-soft); color: var(--warn); border-color: rgba(255, 181, 71, 0.4);
+}
+.task-list li:has(.task-status.Queuing), .task-list li:has(.task-status.Processing),
+.task-list li:has(.task-status.Pending) { border-left-color: var(--warn); }
+.ts { color: var(--fg-3); font-size: 0.75rem; }
 
-.detail-json { background: #f0f0f0; border: 1px solid #ccc; border-radius: 4px; padding: 10px; font-family: monospace; font-size: 0.78rem; white-space: pre-wrap; word-break: break-all; max-height: 400px; overflow-y: auto; }
+/* task list anchors 提升对比度 */
+.task-list a {
+  color: var(--accent);
+  text-decoration: none;
+  padding: 2px 8px;
+  border-radius: 4px;
+  transition: background 120ms ease;
+}
+.task-list a:hover { background: var(--accent-soft); text-decoration: none; }
 
-#detail-panel { display: none; margin-top: 16px; }
-#detail-panel h3 { font-size: 0.95rem; margin-bottom: 8px; }
+/* ============ Detail panel */
+.detail-json {
+  background: rgba(4, 8, 18, 0.7);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.78rem;
+  color: var(--fg-1);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 400px;
+  overflow-y: auto;
+}
+#detail-panel { display: none; margin-top: 0; }
+#detail-panel h3 { font-size: 0.98rem; margin-bottom: 10px; }
+#detail-panel a { color: var(--accent); text-decoration: none; }
+#detail-panel a:hover { color: #7fe0ff; }
 
-.checkbox-label { display: flex; align-items: center; gap: 6px; margin-top: 10px; font-weight: normal; font-size: 0.85rem; cursor: pointer; }
+/* v0.2.0+: Context-IR 提示词优化标记 */
+.detail-ir { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 0.74rem; font-weight: 700; margin-bottom: 8px; letter-spacing: 0.4px; }
+.detail-ir.rewritten { background: var(--ok-soft); color: var(--ok); border: 1px solid rgba(46, 224, 138, 0.4); }
 
-/* API Key header pill */
-.header-row { display: flex; align-items: center; justify-content: space-between; max-width: 640px; margin-bottom: 8px; }
-.header-row h1 { margin-bottom: 0; }
-.key-pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border: 1px solid #ccc; border-radius: 14px; background: #fafafa; font-size: 0.78rem; cursor: pointer; }
-.key-pill:hover { background: #eee; }
-.key-pill .dot { width: 8px; height: 8px; border-radius: 50%; }
-.key-pill.ok .dot { background: #4a4; }
-.key-pill.missing .dot { background: #c44; }
+/* v0.4.0: 用量条改为暗色玻璃质感（替代旧浅色内联样式） */
+.detail-usage {
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  background: rgba(0, 200, 255, 0.07);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.85rem;
+  color: var(--fg-1);
+}
+.detail-usage b { color: var(--warn); }
 
-/* Modal (native <dialog>) */
-dialog { border: 1px solid #ccc; border-radius: 6px; padding: 20px 24px; width: min(520px, 92vw); box-shadow: 0 4px 16px rgba(0,0,0,0.15); color: #222; }
-dialog::backdrop { background: rgba(0,0,0,0.3); }
-dialog h3 { margin: 0 0 8px; font-size: 1.05rem; }
-dialog .status-line { font-size: 0.82rem; color: #555; margin: 0 0 14px; line-height: 1.5; }
-dialog .status-line code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 0.78rem; word-break: break-all; }
-dialog .field-label { display: block; font-size: 0.85rem; font-weight: 600; margin: 0 0 6px; color: #333; }
-dialog input[type=password] { width: 100%; padding: 8px 10px; border: 1px solid #bbb; border-radius: 4px; font-size: 0.92rem; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; box-sizing: border-box; }
-dialog .field-hint { font-size: 0.75rem; color: #888; margin: 6px 0 0; line-height: 1.5; }
+/* checkbox */
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-weight: 500;
+  font-size: 0.85rem;
+  cursor: pointer;
+  color: var(--fg-1);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.checkbox-label input[type=checkbox] {
+  width: 16px; height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* ============ Header + API key pill（hero 内复用） */
+.key-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 16px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(15, 25, 45, 0.7);
+  font-size: 0.82rem;
+  cursor: pointer;
+  color: var(--fg-1);
+  transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+.key-pill:hover { background: rgba(28, 44, 72, 0.85); border-color: var(--border-strong); }
+.key-pill .dot { width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 6px currentColor; }
+.key-pill.ok { color: var(--ok); border-color: rgba(46, 224, 138, 0.5); background: rgba(46, 224, 138, 0.10); }
+.key-pill.ok .dot { background: var(--ok); }
+.key-pill.missing { color: var(--danger); border-color: rgba(255, 77, 126, 0.5); background: rgba(255, 77, 126, 0.08); }
+.key-pill.missing .dot { background: var(--danger); }
+
+/* ============ Modal (native <dialog>) */
+dialog {
+  margin: auto; /* 抵消全局 *{margin:0} 复位，恢复原生 showModal 居中 */
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  padding: 22px 26px;
+  width: min(520px, 92vw);
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.65), 0 0 30px rgba(0, 200, 255, 0.18);
+  color: var(--fg-1);
+  background: var(--bg-1);
+}
+dialog::backdrop {
+  background: rgba(2, 6, 16, 0.75);
+  backdrop-filter: blur(4px);
+}
+dialog h3 { margin: 0 0 8px; font-size: 1.1rem; color: var(--fg-0); }
+dialog .status-line { font-size: 0.84rem; color: var(--fg-2); margin: 0 0 14px; line-height: 1.55; }
+dialog .status-line code { background: rgba(0, 200, 255, 0.08); padding: 1px 6px; border-radius: 3px; font-size: 0.78rem; word-break: break-all; color: var(--accent); }
+dialog .field-label { display: block; font-size: 0.8rem; font-weight: 600; margin: 0 0 6px; color: var(--fg-2); text-transform: uppercase; letter-spacing: 0.5px; }
+dialog input[type=password] { width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 6px; font-size: 0.94rem; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; box-sizing: border-box; background: rgba(8, 14, 28, 0.75); color: var(--fg-0); }
+dialog input[type=password]:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+dialog .field-hint { font-size: 0.75rem; color: var(--fg-3); margin: 6px 0 0; line-height: 1.55; }
 dialog .key-msg { font-size: 0.85rem; min-height: 1.2em; margin: 10px 0 0; }
-dialog .key-msg.err { color: #c00; }
-dialog .key-msg.ok { color: #060; }
+dialog .key-msg.err { color: var(--danger); }
+dialog .key-msg.ok { color: var(--ok); }
 dialog .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 
-/* v0.1.3b prepare/commit flow */
-.ir-status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
-.ir-status.rewritten { background: #e8f5e8; color: #060; }
-.ir-status.fallback { background: #fff5e0; color: #a60; }
-.ir-status.disabled { background: #eee; color: #666; }
+/* ============ IR status pills */
+.ir-status { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.74rem; font-weight: 700; letter-spacing: 0.4px; border: 1px solid transparent; }
+.ir-status.rewritten { background: var(--ok-soft); color: var(--ok); border-color: rgba(46, 224, 138, 0.4); }
+.ir-status.fallback { background: var(--warn-soft); color: var(--warn); border-color: rgba(255, 181, 71, 0.4); }
+.ir-status.disabled { background: rgba(120, 140, 170, 0.14); color: var(--fg-2); border-color: rgba(120, 140, 170, 0.3); }
 
-details.advanced { margin-top: 12px; }
-details.advanced summary { cursor: pointer; font-size: 0.85rem; color: #555; padding: 4px 0; }
-details.advanced[open] summary { margin-bottom: 8px; }
+details.advanced { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+details.advanced summary { cursor: pointer; font-size: 0.85rem; color: var(--accent); padding: 4px 0; }
+details.advanced summary:hover { color: #7fe0ff; }
+details.advanced[open] summary { margin-bottom: 10px; }
 
-#plan-panel { display: none; margin-top: 14px; padding: 12px; background: #fafafa; border: 1px solid #e0e0e0; border-radius: 4px; }
-#plan-panel h4 { font-size: 0.95rem; margin-bottom: 8px; }
-.plan-section { margin: 8px 0; }
-.plan-section-title { font-size: 0.8rem; font-weight: 600; color: #555; margin-bottom: 4px; }
-.plan-warn { background: #fff8e1; border-left: 3px solid #f0a020; padding: 6px 10px; margin: 6px 0; font-size: 0.83rem; border-radius: 2px; }
-.plan-segment { padding: 4px 0; font-size: 0.85rem; font-family: monospace; }
-.plan-content-item { padding: 2px 0; font-size: 0.8rem; color: #444; word-break: break-all; }
-.plan-content-item .kind { display: inline-block; min-width: 70px; color: #888; }
-.plan-prompt-box { background: #fff; border: 1px solid #ddd; padding: 6px 8px; border-radius: 3px; font-family: monospace; font-size: 0.8rem; white-space: pre-wrap; max-height: 200px; overflow-y: auto; word-break: break-all; }
-.plan-prompt-toggle { font-size: 0.78rem; color: #06c; cursor: pointer; user-select: none; }
-.plan-prompt-toggle:hover { text-decoration: underline; }
-#plan-actions { display: flex; gap: 8px; margin-top: 12px; }
+/* submit-row 加大（v0.4.0） */
+#submit-row { display: flex; gap: 12px; align-items: center; margin-top: 20px; }
+#submit-row .btn-primary {
+  padding: 12px 28px;
+  font-size: 1rem;
+}
 
-#submit-row { display: flex; gap: 8px; align-items: center; margin-top: 14px; }
-#submit-row .btn-primary { margin-right: 4px; }
+/* ============ Layout: 双列（左表单 / 右详情+任务），max-width 1320px 居中 */
+.layout {
+  width: 100%;
+  max-width: 1320px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(360px, 0.9fr);
+  gap: 20px;
+  align-items: start;
+}
+.main-col { display: flex; flex-direction: column; min-width: 0; }
+.right-col { display: flex; flex-direction: column; gap: 0; min-width: 0; position: sticky; top: 20px; }
+
+/* 必填字段红星 + 错误高亮 */
+label[data-required="true"]::after {
+  content: " *";
+  color: var(--danger);
+  font-weight: 700;
+  margin-left: 2px;
+}
+.is-error, .is-error:focus {
+  border-color: var(--danger) !important;
+  box-shadow: 0 0 0 3px var(--danger-soft) !important;
+  background: rgba(255, 77, 126, 0.06) !important;
+}
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-4px); }
+  75% { transform: translateX(4px); }
+}
+.is-error { animation: shake 280ms ease-out; }
+
+/* duration summary inline note */
+#duration-summary { color: var(--fg-3); font-size: 0.82em; margin-left: 8px; }
+
+/* link 色彩统一到主色 — 包括页面内所有未在更具体选择器覆盖的 a */
+a { color: var(--accent); }
+a:hover { color: #7fe0ff; }
+
+/* ============ Footer */
+.page-footer {
+  width: 100%;
+  max-width: 1320px;
+  margin: 12px auto 0;
+  text-align: center;
+  font-size: 0.78rem;
+  color: var(--fg-3);
+  letter-spacing: 0.5px;
+}
+
+/* ============ Responsive: 窄屏塌为单列 */
+@media (max-width: 980px) {
+  body { padding: 14px; }
+  h1 { font-size: 1.4rem; letter-spacing: 1px; }
+  h1 .brand-suffix { font-size: 0.85rem; display: block; margin-left: 0; margin-top: 2px; }
+  .hero { min-height: 120px; }
+  .hero-inner { padding: 16px 18px; }
+  .brand-logo { width: 40px; height: 40px; }
+  .key-pill { font-size: 0.75rem; padding: 4px 10px; }
+  .layout {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+  .right-col { position: static; }
+  .card { padding: 16px 16px; }
+  .task-list li { font-size: 0.82rem; padding: 10px 12px; }
+  .task-id { font-size: 0.72rem; word-break: break-all; }
+  dialog { width: min(440px, 94vw); padding: 18px 18px; }
+  .mode-radios label { padding: 8px 14px; font-size: 0.85rem; }
+  input[type=text], input[type=number], textarea, select { font-size: 0.95rem; }
+  #submit-row .btn-primary { padding: 10px 22px; font-size: 0.95rem; }
+}
 </style>
 </head>
 <body>
-<div class="header-row">
-  <h1>minipic</h1>
-  <button id="key-pill" class="key-pill missing" onclick="openKeyDialog()" title="点击配置 API Key">
-    <span class="dot"></span><span id="key-pill-label">API Key: 未配置</span>
-  </button>
-</div>
-<p class="sub">MiniMax H3 视频生成 · 本地 UI</p>
+<header class="hero">
+  <div class="hero-inner">
+    <div class="brand">
+      <img class="brand-logo" src="/assets/logo.png" alt="MiniCopy">
+      <div>
+        <h1>MiniCopy<span class="brand-suffix">-阿米巴破局者-短视频复刻工具</span></h1>
+        <p class="sub">MiniMax H3 视频生成 · 本地 UI</p>
+      </div>
+    </div>
+    <button id="key-pill" class="key-pill missing" onclick="openKeyDialog()" title="点击配置 API Key">
+      <span class="dot"></span><span id="key-pill-label">API Key: 未配置</span>
+    </button>
+  </div>
+</header>
 
 <dialog id="key-dialog">
   <h3>配置 API Key</h3>
@@ -136,136 +602,139 @@ details.advanced[open] summary { margin-bottom: 8px; }
   </div>
 </dialog>
 
-<div class="card">
+<div class="layout">
+<div class="main-col">
+<div class="card form-card">
   <h2>创建任务</h2>
 
   <div class="mode-radios">
-    <label><input type="radio" name="mode" value="t2v"> t2v（文生视频）</label>
-    <label><input type="radio" name="mode" value="i2v"> i2v（首帧图生视频）</label>
-    <label><input type="radio" name="mode" value="r2v" checked> r2v（多模态参考）</label>
+    <label><input type="radio" name="mode" value="t2v"> <span class="mode-icon">📝</span> t2v（文生视频）</label>
+    <label><input type="radio" name="mode" value="i2v"> <span class="mode-icon">🖼</span> i2v（首帧图生视频）</label>
+    <label><input type="radio" name="mode" value="r2v" checked> <span class="mode-icon">🎞</span> r2v（多模态参考）</label>
   </div>
 
-  <label for="model">模型</label>
-  <select id="model">
-    <option value="MiniMax-H3" selected>MiniMax-H3（默认 · 768P/2K · 4-15s）</option>
-    <option value="MiniMax-H3-Max">MiniMax-H3-Max（480P/768P · 5-15s）</option>
-  </select>
+  <div class="form-section">
+    <span class="form-section-title">基本设置</span>
 
-  <label for="prompt">提示词</label>
-  <textarea id="prompt" placeholder="描述你想生成的视频内容"></textarea>
+    <label for="model">模型</label>
+    <select id="model">
+      <option value="MiniMax-H3" selected>MiniMax-H3（默认 · 768P/2K · 4-15s · 全能力 · 首帧/尾帧）</option>
+      <option value="MiniMax-H3-Max">MiniMax-H3-Max（480P/768P · 5-15s · 无多模态参考 · 首帧/尾帧）</option>
+    </select>
 
-  <label for="duration">时长（秒，<span id="duration-range-label">4-15</span>）</label>
-  <input type="number" id="duration" value="10" min="4" max="15" title="每段生成的时长。R2V 多段模式下由参考视频切段决定，此值无效。">
-  <span id="duration-summary" style="margin-left:8px;color:#666;font-size:0.9em;"></span>
+    <label for="prompt" data-required="true">提示词</label>
+    <textarea id="prompt" placeholder="描述你想生成的视频内容"></textarea>
 
-  <label for="ratio">比例（t2v 专用）</label>
-  <select id="ratio">
-    <option value="">-- 选择比例 --</option>
-    <option value="adaptive">adaptive</option>
-    <option value="16:9">16:9</option>
-    <option value="9:16">9:16</option>
-    <option value="1:1">1:1</option>
-    <option value="4:3">4:3</option>
-    <option value="3:4">3:4</option>
-    <option value="21:9">21:9</option>
-  </select>
+    <label for="duration">时长（秒，<span id="duration-range-label">4-15</span>）</label>
+    <input type="number" id="duration" value="10" min="4" max="15" title="单段生成的时长（≤15s，H3 上限）。">
+    <span id="duration-summary" style="margin-left:8px;color:#666;font-size:0.9em;"></span>
+  </div>
 
-  <label for="resolution">分辨率</label>
-  <select id="resolution">
-    <option value="768P" selected>768P</option>
-    <option value="2K">2K</option>
-    <option value="480P">480P</option>
-  </select>
+  <div class="form-section">
+    <span class="form-section-title">画面参数</span>
 
-  <!-- i2v: one image row -->
-  <div id="i2v-row" style="display:none">
-    <label>首帧图路径</label>
-    <div class="ref-row" id="i2v-ref-row">
-      <input type="text" placeholder="/path/to/image.png">
-      <select>
-        <option value="first_frame" selected>first_frame</option>
-      </select>
-      <button type="button" class="btn btn-small" onclick="pickFile(this, 'image/png,image/jpeg,image/webp')">📎</button>
-      <input type="file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="uploadFile(this)">
+    <label for="ratio">比例（t2v 专用）</label>
+    <select id="ratio">
+      <option value="">-- 选择比例 --</option>
+      <option value="adaptive">adaptive</option>
+      <option value="16:9">16:9</option>
+      <option value="9:16">9:16</option>
+      <option value="1:1">1:1</option>
+      <option value="4:3">4:3</option>
+      <option value="3:4">3:4</option>
+      <option value="21:9">21:9</option>
+    </select>
+
+    <label for="resolution">分辨率</label>
+    <select id="resolution">
+      <option value="768P" selected>768P</option>
+      <option value="2K">2K</option>
+      <option value="480P">480P</option>
+    </select>
+  </div>
+
+  <div class="form-section">
+    <span class="form-section-title">参考素材</span>
+
+    <!-- i2v: first_frame（必填）+ 可选 last_frame（首+尾帧组合） -->
+    <div id="i2v-row" style="display:none">
+      <label data-required="true">首帧图路径（first_frame）</label>
+      <div class="ref-row" id="i2v-first-row">
+        <input type="text" id="i2v-first-path" placeholder="/path/to/image.png">
+        <button type="button" class="btn btn-small" onclick="pickFile(this, 'image/png,image/jpeg,image/webp,image/heic,image/heif')">📎</button>
+        <input type="file" accept="image/png,image/jpeg,image/webp,image/heic,image/heif" style="display:none" onchange="uploadFile(this)">
+      </div>
+      <label style="margin-top:10px">尾帧图路径（last_frame，可选；首+尾帧组合时填写）</label>
+      <div class="ref-row" id="i2v-last-row">
+        <input type="text" id="i2v-last-path" placeholder="/path/to/image.png（可选）">
+        <button type="button" class="btn btn-small" onclick="pickFile(this, 'image/png,image/jpeg,image/webp,image/heic,image/heif')">📎</button>
+        <input type="file" accept="image/png,image/jpeg,image/webp,image/heic,image/heif" style="display:none" onchange="uploadFile(this)">
+      </div>
+    </div>
+
+    <!-- r2v: dynamic media rows -->
+    <div id="r2v-section" style="display:none">
+      <div class="media-section">
+        <span>参考图：</span>
+        <button class="btn btn-small" onclick="addRef('image')">+ 图片</button>
+      </div>
+      <div id="ref-images"></div>
+
+      <div class="media-section">
+        <span>参考视频：</span>
+        <button class="btn btn-small" onclick="addRef('video')">+ 视频</button>
+      </div>
+      <div id="ref-videos"></div>
+
+      <div class="media-section">
+        <span>参考音频：</span>
+        <button class="btn btn-small" onclick="addRef('audio')">+ 音频</button>
+      </div>
+      <div id="ref-audios"></div>
     </div>
   </div>
 
-  <!-- r2v: dynamic media rows -->
-  <div id="r2v-section" style="display:none">
-    <div class="media-section">
-      <span>参考图：</span>
-      <button class="btn btn-small" onclick="addRef('image')">+ 图片</button>
-    </div>
-    <div id="ref-images"></div>
+  <div class="form-section">
+    <span class="form-section-title">生成选项</span>
 
-    <div class="media-section">
-      <span>参考视频：</span>
-      <button class="btn btn-small" onclick="addRef('video')">+ 视频</button>
-    </div>
-    <div id="ref-videos"></div>
+    <label class="checkbox-label">
+      <input type="checkbox" id="wait">
+      <span>等待结果（阻塞请求直到视频生成完成，可能需要 15-30 分钟）</span>
+    </label>
 
-    <div class="media-section">
-      <span>参考音频：</span>
-      <button class="btn btn-small" onclick="addRef('audio')">+ 音频</button>
-    </div>
-    <div id="ref-audios"></div>
-  </div>
-
-  <label class="checkbox-label">
-    <input type="checkbox" id="wait">
-    <span>等待结果（阻塞请求直到视频生成完成，可能需要 15-30 分钟）</span>
-  </label>
-
-  <div id="submit-row">
-    <button class="btn btn-primary" id="submit-btn" onclick="onSubmitClick()">准备 + 提交</button>
-    <span id="msg"></span>
-    <span id="ir-pill" class="ir-status disabled" style="margin-left:auto" title="Context-IR prompt rewrite">Context-IR: 默认开</span>
-  </div>
-
-  <details class="advanced">
-    <summary>高级</summary>
     <label class="checkbox-label">
       <input type="checkbox" id="use-context-ir" checked>
-      <span>使用 Context-IR 改写提示词（推荐）</span>
+      <span>使用 Context-IR 优化提示词（H3 默认开启 · H3-Max 自动跳过 · 失败时回退原文）</span>
     </label>
-    <label class="checkbox-label">
-      <input type="checkbox" id="skip-confirm">
-      <span>一步提交（跳过准备预览，直接调 H3）</span>
-    </label>
-  </details>
+  </div>
 
-  <div id="plan-panel">
-    <h4>准备计划 <span id="plan-prepare-id" class="task-id"></span></h4>
-    <div id="plan-ir-status" class="plan-section"></div>
-    <div id="plan-warnings" class="plan-section"></div>
-    <div id="plan-segments" class="plan-section"></div>
-    <div id="plan-content" class="plan-section"></div>
-    <div id="plan-prompt-section" class="plan-section">
-      <div class="plan-section-title">
-        <span class="plan-prompt-toggle" id="plan-prompt-toggle">显示原 prompt ▾</span>
-      </div>
-      <div class="plan-prompt-box" id="plan-prompt-box" style="display:none"></div>
-    </div>
-    <div id="plan-actions">
-      <button class="btn" onclick="cancelPlan()">取消</button>
-      <button class="btn btn-primary" id="plan-commit-btn" onclick="commitPlan()">确认提交</button>
-    </div>
+  <div id="submit-row">
+    <button class="btn btn-primary" id="submit-btn" onclick="submitTask()">提交</button>
+    <span id="msg"></span>
   </div>
 </div>
+</div><!-- /main-col -->
 
-<div class="card" id="detail-panel">
-  <h3>任务详情</h3>
-  <div id="detail-json" class="detail-json"></div>
-  <p style="margin-top:8px;font-size:0.85rem">
-    <span id="detail-dl-btn"></span>
-    <button class="btn btn-small" onclick="closeDetail()" style="margin-left:8px">关闭</button>
-  </p>
-</div>
+<aside class="right-col">
+  <div class="card" id="detail-panel">
+    <h3>任务详情</h3>
+    <div id="detail-ir" style="display:none;margin-bottom:8px"></div>
+    <div id="detail-usage" class="detail-usage" style="display:none"></div>
+    <div id="detail-json" class="detail-json"></div>
+    <p style="margin-top:8px;font-size:0.85rem">
+      <span id="detail-dl-btn"></span>
+      <button class="btn btn-small" onclick="closeDetail()" style="margin-left:8px">关闭</button>
+    </p>
+  </div>
 
-<div class="card">
-  <h2>最近任务 <button class="btn btn-small" onclick="loadTasks()" style="margin-left:12px">刷新</button></h2>
-  <ul class="task-list" id="task-list"><li style="color:#999">加载中…</li></ul>
-</div>
+  <div class="card">
+    <h2>最近任务 <button class="btn btn-small" onclick="loadTasks()" style="margin-left:12px">刷新</button></h2>
+    <ul class="task-list" id="task-list"><li style="color:#999">加载中…</li></ul>
+  </div>
+</aside>
+</div><!-- /layout -->
+
+  <footer class="page-footer">MiniCopy · MiniMax H3 本地 UI</footer>
 
 <script>
 const BASE = '/api';
@@ -300,15 +769,13 @@ function addRef(type) {
       '<input type="text" placeholder="/path/to/image.png">' +
       '<select>' +
         '<option value="reference_image" selected>reference_image</option>' +
-        '<option value="first_frame">first_frame</option>' +
       '</select>' +
-      '<button type="button" class="btn btn-small" onclick="pickFile(this, \'image/png,image/jpeg,image/webp\')">📎</button>' +
-      '<input type="file" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="uploadFile(this)">' +
+      '<button type="button" class="btn btn-small" onclick="pickFile(this, \'image/png,image/jpeg,image/webp,image/heic,image/heif\')">📎</button>' +
+      '<input type="file" accept="image/png,image/jpeg,image/webp,image/heic,image/heif" style="display:none" onchange="uploadFile(this)">' +
       '<button class="btn btn-small btn-danger" onclick="this.parentNode.remove()">×</button>';
   } else if (type === 'video') {
     row.innerHTML =
       '<input type="text" placeholder="/path/to/video.mp4">' +
-      '<input type="text" placeholder="clips (0:5,30:5)" title="留空自动采样">' +
       '<button type="button" class="btn btn-small" onclick="pickFile(this, \'video/mp4,video/quicktime\')">📎</button>' +
       '<input type="file" accept="video/mp4,video/quicktime" style="display:none" onchange="uploadFile(this)">' +
       '<button class="btn btn-small btn-danger" onclick="this.parentNode.remove()">×</button>';
@@ -335,13 +802,18 @@ function buildPayload() {
     ref_videos: [],
     ref_audios: [],
     wait: $('wait').checked,
+    use_context_ir: $('use-context-ir').checked,
   };
 
   if (mode === 'i2v') {
-    const row = $('i2v-ref-row');
-    const pathInput = row.querySelector('input');
-    if (pathInput.value.trim()) {
-      payload.ref_images.push({ path: pathInput.value.trim(), role: 'first_frame' });
+    // i2v 固定为 first_frame（必填） + 可选 last_frame；角色不再有下拉。
+    const firstPath = $('i2v-first-path').value.trim();
+    const lastPath = $('i2v-last-path').value.trim();
+    if (firstPath) {
+      payload.ref_images.push({ path: firstPath, role: 'first_frame' });
+    }
+    if (lastPath) {
+      payload.ref_images.push({ path: lastPath, role: 'last_frame' });
     }
   } else if (mode === 'r2v') {
     $('ref-images').querySelectorAll('.ref-row').forEach(function(row) {
@@ -355,12 +827,8 @@ function buildPayload() {
     });
     $('ref-videos').querySelectorAll('.ref-row').forEach(function(row) {
       const path = row.querySelector('input').value.trim();
-      const clips = row.querySelectorAll('input')[1];
       if (path) {
-        payload.ref_videos.push({
-          path: path,
-          clips: clips && clips.value.trim() || null,
-        });
+        payload.ref_videos.push({ path: path });
       }
     });
     $('ref-audios').querySelectorAll('.ref-row').forEach(function(row) {
@@ -377,173 +845,24 @@ function setMsg(text, isErr) {
   el.className = isErr ? 'err' : 'ok';
 }
 
-// ============================================================ v0.1.3b prepare / commit
-let currentPrepare = null;       // last /api/prepare response
-let currentPreparePayload = null; // payload that was sent (for re-display)
-
-function applyContextIrPill(usedIr, fallback) {
-  const el = $('ir-pill');
-  el.classList.remove('rewritten', 'fallback', 'disabled');
-  if (usedIr) {
-    el.classList.add('rewritten');
-    el.textContent = 'Context-IR: ✓ 已改写';
-  } else if (fallback) {
-    el.classList.add('fallback');
-    el.textContent = 'Context-IR: ⚠ 降级到原 prompt';
-  } else {
-    el.classList.add('disabled');
-    el.textContent = 'Context-IR: 未使用';
-  }
+// ============================================================ v0.1.5 single-segment submit
+function flashError(fieldId) {
+  const el = $(fieldId); if (!el) return;
+  el.classList.remove('is-error');
+  // force reflow so the animation re-triggers
+  void el.offsetWidth;
+  el.classList.add('is-error');
+  el.focus();
+  setTimeout(function() { el.classList.remove('is-error'); }, 2200);
 }
 
-function renderPlan(plan) {
-  $('plan-prepare-id').textContent = plan.prepare_id || '';
-  applyContextIrPill(plan.used_context_ir, plan.context_ir_fallback);
-
-  // Warnings
-  const warns = $('plan-warnings');
-  warns.innerHTML = '';
-  (plan.warnings || []).forEach(function(w) {
-    const div = document.createElement('div');
-    div.className = 'plan-warn';
-    div.textContent = '⚠ ' + w;
-    warns.appendChild(div);
-  });
-
-  // Segments
-  const segs = $('plan-segments');
-  segs.innerHTML = '';
-  if (plan.segments && plan.segments.length > 0) {
-    const title = document.createElement('div');
-    title.className = 'plan-section-title';
-    title.textContent = '切点表（' + plan.estimated_segments + ' 段）';
-    segs.appendChild(title);
-    plan.segments.forEach(function(s) {
-      const div = document.createElement('div');
-      div.className = 'plan-segment';
-      div.textContent =
-        '段 ' + s.index + ': ' + s.start_seconds.toFixed(2) + 's + ' +
-        s.duration_seconds + 's → ' + (s.ref_clip_path || '');
-      segs.appendChild(div);
-    });
-  }
-
-  // Content
-  const content = $('plan-content');
-  content.innerHTML = '';
-  const contentTitle = document.createElement('div');
-  contentTitle.className = 'plan-section-title';
-  contentTitle.textContent = 'Content[]（送 H3 的内容）';
-  content.appendChild(contentTitle);
-  (plan.content_preview || []).forEach(function(item, i) {
-    const div = document.createElement('div');
-    div.className = 'plan-content-item';
-    const kind = item.type || '?';
-    let val = '';
-    if (kind === 'text') {
-      val = (item.text || '').slice(0, 120) +
-        ((item.text || '').length > 120 ? '…' : '');
-    } else if (kind === 'video_url' || kind === 'image_url' || kind === 'audio_url') {
-      val = (item.url || '').slice(0, 100);
-    } else {
-      val = JSON.stringify(item).slice(0, 100);
-    }
-    div.innerHTML = '<span class="kind">[' + i + '] ' + kind + '</span>' + escHtml(val);
-    content.appendChild(div);
-  });
-
-  // Prompt (collapsible — default show the enhanced one if used, original otherwise)
-  const promptBox = $('plan-prompt-box');
-  const promptToggle = $('plan-prompt-toggle');
-  promptBox.textContent = plan.used_context_ir
-    ? (plan.enhanced_prompt || '')
-    : (plan.original_prompt || plan.enhanced_prompt || '');
-  promptToggle.textContent = '显示 ' +
-    (plan.used_context_ir ? 'Context-IR 改写' : '原 prompt') + ' ▾';
-
-  $('plan-panel').style.display = 'block';
-}
-
-function hidePlan() {
-  $('plan-panel').style.display = 'none';
-  currentPrepare = null;
-  currentPreparePayload = null;
-}
-
-async function onSubmitClick() {
-  if ($('skip-confirm').checked) {
-    return submitTaskLegacy();
-  }
-  return prepareTask();
-}
-
-async function prepareTask() {
+async function submitTask() {
   setMsg('', false);
   const payload = buildPayload();
-  if (!payload.prompt) { setMsg('请填写提示词', true); return; }
-  payload.use_context_ir = $('use-context-ir').checked;
-  setMsg('准备中…', false);
-  try {
-    const res = await fetch(BASE + '/prepare', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      setMsg('准备失败: ' + (data.detail || res.status), true);
-      hidePlan();
-      return;
-    }
-    currentPrepare = data;
-    currentPreparePayload = payload;
-    setMsg('已准备，查看下方计划后确认提交', false);
-    renderPlan(data);
-  } catch(e) {
-    setMsg('网络错误: ' + e.message, true);
+  if (!payload.prompt) { setMsg('请填写提示词', true); flashError('prompt'); return; }
+  if (payload.mode === 'i2v' && payload.ref_images.length === 0) {
+    setMsg('请填写首帧图路径', true); flashError('i2v-first-path'); return;
   }
-}
-
-async function commitPlan() {
-  if (!currentPrepare) return;
-  const prepareId = currentPrepare.prepare_id;
-  setMsg('提交中…', false);
-  $('plan-commit-btn').disabled = true;
-  try {
-    const res = await fetch(BASE + '/commit/' + encodeURIComponent(prepareId), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      setMsg('提交失败: ' + (data.detail || res.status), true);
-      return;
-    }
-    setMsg('已提交，task_id: ' + data.task_id, false);
-    hidePlan();
-    $('detail-dl-btn').innerHTML =
-      '<a href="#" onclick="showTask(\'' + data.task_id + '\');return false">查看状态</a>';
-    showTask(data.task_id);
-    loadTasks();
-  } catch(e) {
-    setMsg('网络错误: ' + e.message, true);
-  } finally {
-    $('plan-commit-btn').disabled = false;
-  }
-}
-
-function cancelPlan() {
-  hidePlan();
-  setMsg('已取消准备', false);
-}
-
-// Original one-shot submit (used when "skip-confirm" is checked)
-async function submitTaskLegacy() {
-  setMsg('', false);
-  const payload = buildPayload();
-  if (!payload.prompt) { setMsg('请填写提示词', true); return; }
-  payload.use_context_ir = $('use-context-ir').checked;
   try {
     const res = await fetch(BASE + '/create', {
       method: 'POST',
@@ -564,10 +883,6 @@ async function submitTaskLegacy() {
     setMsg('网络错误: ' + e.message, true);
   }
 }
-
-// Keep `submitTask` as an alias for backward-compat in case any browser
-// extension / automation still calls the old function name.
-async function submitTask() { return onSubmitClick(); }
 
 // ============================================================ v0.1.4 file upload helpers
 async function uploadFile(fileInput) {
@@ -609,7 +924,10 @@ async function maybeAutofillDuration(path) {
     const capped = Math.min(15, Math.max(5, Math.round(seconds)));
     durInput.value = String(capped);
     if (seconds > 15.5) {
-      alert(`参考视频 ${seconds.toFixed(1)}s 已自动填入单段上限 15s；将走多段生成`);
+      alert(
+        `参考视频 ${seconds.toFixed(1)}s 超过 15s 上限，H3 已不支持多段生成，` +
+        `请先截取到 ≤15s 再提交`
+      );
     }
     updateDurationSummary();
   } catch (_) { /* silent */ }
@@ -657,6 +975,32 @@ async function showTask(taskId) {
     }
     const t = await res.json();
     $('detail-json').textContent = JSON.stringify(t, null, 2);
+    // Context-IR 提示词优化标记（仅当后端持久化了 used_context_ir 时显示）
+    const irBox = $('detail-ir');
+    const usedIR = !!(t.extra && t.extra.used_context_ir);
+    if (usedIR) {
+      irBox.innerHTML = '<span class="detail-ir rewritten">\u2728 \u63d0\u793a\u8bcd\u5df2\u7531 Context-IR \u4f18\u5316</span>';
+      irBox.style.display = 'block';
+    } else {
+      irBox.style.display = 'none';
+    }
+    // 用量 / 费用展示（usage 由后端从 API 响应持久化到 extra）
+    const usageBox = $('detail-usage');
+    const usage = (t.extra && t.extra.usage) || t.usage;
+    if (usage && (usage.total_seconds != null || usage.output_seconds != null)) {
+      const totalSec = Number(usage.total_seconds || usage.output_seconds || 0);
+      // 按分辨率估算费用（国内官方刊例价）：768P ¥0.50/s、2K ¥0.80/s；480P 无公开单价，用 768P 近似
+      const rate = (t.resolution === '2K') ? 0.80 : 0.50;
+      const cost = (totalSec * rate).toFixed(2);
+      usageBox.innerHTML =
+        '⏱ 生成时长 ' + totalSec + 's' +
+        '（输入 ' + (usage.input_seconds != null ? usage.input_seconds + 's' : '—') +
+        ' / 输出 ' + (usage.output_seconds != null ? usage.output_seconds + 's' : '—') + '）' +
+        ' · 估算费用 <b>¥' + cost + '</b>';
+      usageBox.style.display = 'block';
+    } else {
+      usageBox.style.display = 'none';
+    }
     let dl = '';
     const url = t.content_url || t.output_path;
     if (url) {
@@ -691,39 +1035,29 @@ function updateDurationSummary() {
   const summary = $('duration-summary');
   if (!summary) return;
   const durInput = $('duration');
+  if (durInput) {
+    // Always enabled in v0.1.5+ (no multi-segment path).
+    durInput.disabled = false;
+    durInput.title = '单段生成的时长（≤15s，H3 上限）';
+  }
   const refPaths = Array.from(document.querySelectorAll('#ref-videos .ref-row input[type=text]'))
     .map(function(i) { return i.value.trim(); })
     .filter(Boolean);
   if (refPaths.length === 0) {
     summary.textContent = '';
-    if (durInput) { durInput.disabled = false; durInput.title = ''; }
     return;
   }
-  // R2V multi-segment: output duration is determined by how we split the
-  // reference video (plan_segments), NOT by the duration input. The duration
-  // input is only honored when the reference is short enough for a single
-  // segment (≤15s).
+  // Single-segment mode: just report the reference video's duration. Warn the
+  // user if it exceeds H3's 15s cap (multi-segment generation was removed).
   fetch(BASE + '/probe/video?path=' + encodeURIComponent(refPaths[0]))
     .then(function(r) { return r.ok ? r.json() : null; })
     .then(function(d) {
       if (!d || !Number.isFinite(d.duration)) { summary.textContent = ''; return; }
       const ref = d.duration;
-      const segs = Math.min(4, Math.max(1, Math.ceil(ref / 15)));
-      const total = Math.round(ref);
-      const isMulti = segs > 1;
-      if (isMulti) {
-        summary.textContent = '多段输出 ≈ ' + total + 's（参考视频 ' + ref.toFixed(1) + 's 切 ' + segs + ' 段喂 H3，时长由参考决定）';
-        if (durInput) {
-          durInput.disabled = true;
-          durInput.title = 'R2V 多段模式下由参考视频切段决定，此值无效';
-        }
-      } else {
-        summary.textContent = '单段输出 ≈ ' + total + 's（参考视频 ' + ref.toFixed(1) + 's）';
-        if (durInput) {
-          durInput.disabled = false;
-          durInput.title = '每段生成的时长';
-        }
-      }
+      const overCap = ref > 15 + 0.05;
+      summary.textContent = overCap
+        ? `参考视频 ${ref.toFixed(1)}s — 超过 15s 上限，请先截取到 ≤15s`
+        : `参考视频 ${ref.toFixed(1)}s`;
     })
     .catch(function() { summary.textContent = ''; });
 }
@@ -757,8 +1091,24 @@ function applyModelConstraints() {
     }
     res.appendChild(opt);
   });
+
+  // 模式能力联动：所选模型不支持当前 mode → 自动回退到 t2v。
+  const currentMode = getMode();
+  const modes = c.modes || ['t2v', 'i2v', 'r2v'];
+  if (currentMode === 'r2v' && modes.indexOf('r2v') === -1) {
+    document.querySelector('input[name="mode"][value="t2v"]').checked = true;
+    alert('H3-Max 不支持多模态参考（r2v），已自动切换到 t2v');
+    updateModeUI();
+  }
+
+  // i2v 角色已固定为首帧 + 可选尾帧（v0.1.6+），无需再按模型动态重建。
+  // i2v_roles 字段保留在 /api/config 响应里供上层使用。
+
   updateDurationSummary();
 }
+
+// rebuildI2vRoleOptions 已废弃（i2v 角色固定）；保留为空 stub 以便未来扩展时查找。
+function rebuildI2vRoleOptions(_roles) { /* no-op since v0.1.6 */ }
 
 async function loadConfigStatus() {
   try {
@@ -772,6 +1122,8 @@ async function loadConfigStatus() {
         resolutions: m.resolutions,
         duration_min: m.duration_min,
         duration_max: m.duration_max,
+        modes: m.modes || ['t2v', 'i2v', 'r2v'],
+        i2v_roles: m.i2v_roles || ['first_frame', 'last_frame'],
       };
     });
     // Update pill
@@ -780,9 +1132,11 @@ async function loadConfigStatus() {
     if (cfg.has_key) {
       pill.classList.remove('missing');
       pill.classList.add('ok');
-      const srcLabel = cfg.source === 'env' ? '（env 优先 · UI 改动不生效）'
+      // v0.2.0+: UI 只认用户配置；source 仅可能为 "user" / "none"。
+      // 保留 env/local 分支作为防御性兜底（万一后端未来扩展）。
+      const srcLabel = cfg.source === 'user'  ? '（用户配置）'
                     : cfg.source === 'local' ? '（local config.json）'
-                    : cfg.source === 'user'  ? '（用户配置）'
+                    : cfg.source === 'env'   ? '（环境变量兜底 · MINIMAX_API_KEY）'
                     : '';
       lbl.textContent = 'API Key: ' + cfg.masked + ' ' + srcLabel;
       pill.title = '来源: ' + cfg.source;
@@ -847,31 +1201,8 @@ function setKeyMsg(text, isErr) {
 // Wire model select
 $('model').addEventListener('change', applyModelConstraints);
 
-// Wire duration input — recompute segment preview on every keystroke.
+// Wire duration input — recompute duration summary on every keystroke.
 $('duration').addEventListener('input', updateDurationSummary);
-
-// v0.1.3b: Context-IR checkbox live updates the status pill
-$('use-context-ir').addEventListener('change', function() {
-  if (this.checked) {
-    applyContextIrPill(false, false);
-    $('ir-pill').textContent = 'Context-IR: 默认开';
-  } else {
-    applyContextIrPill(false, false);
-    $('ir-pill').textContent = 'Context-IR: 已禁用';
-  }
-});
-
-// v0.1.3b: prompt toggle in the plan panel
-$('plan-prompt-toggle').addEventListener('click', function() {
-  const box = $('plan-prompt-box');
-  if (box.style.display === 'none') {
-    box.style.display = 'block';
-    this.textContent = this.textContent.replace('▾', '▴');
-  } else {
-    box.style.display = 'none';
-    this.textContent = this.textContent.replace('▴', '▾');
-  }
-});
 
 loadConfigStatus();
 </script>

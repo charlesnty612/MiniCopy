@@ -81,10 +81,13 @@ class TestLoadConfigDefaults:
 
 # --------------------------------------------------------------------------- load_config — file precedence
 class TestLoadConfigFilePrecedence:
-    def test_local_config_overrides_user_config(
+    def test_user_config_overrides_local_config(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Plant a user config and a local config; local must win.
+        """v0.2.0+: user config wins over local cwd config.json. The user
+        config file is the single source of truth for the API key; the local
+        config only matters as a developer-time fallback when no user config
+        exists. base_url still falls back to local if user didn't set it."""
         user_cfg_dir = tmp_path / "user_cfg"
         user_cfg_dir.mkdir(parents=True, exist_ok=True)
         user_path = user_cfg_dir / "config.json"
@@ -93,7 +96,7 @@ class TestLoadConfigFilePrecedence:
             encoding="utf-8",
         )
         monkeypatch.setattr(config_mod, "_user_config_path", lambda: user_path)
-        # Cwd config
+        # Cwd config with a different api_key — must NOT win.
         local = tmp_path / "local_dir"
         local.mkdir()
         (local / "config.json").write_text(
@@ -101,13 +104,77 @@ class TestLoadConfigFilePrecedence:
         )
         monkeypatch.chdir(local)
         cfg = load_config()
-        assert cfg.api_key == "local-key"
-        # base_url should still be the user one (local didn't set it)
+        assert cfg.api_key == "user-key"
+        # base_url comes from user (user file is read after local; user wins)
         assert cfg.base_url == "https://user"
 
-    def test_env_overrides_file_values(
+    def test_local_used_when_no_user_config(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """v0.2.0+: when no user config exists, local cwd config.json is the
+        file source. (conftest's autouse fixture already isolates the user
+        config path to an empty tmp file.)"""
+        local = tmp_path / "local_dir"
+        local.mkdir()
+        (local / "config.json").write_text(
+            json.dumps({"api_key": "local-only"}), encoding="utf-8"
+        )
+        monkeypatch.chdir(local)
+        cfg = load_config()
+        assert cfg.api_key == "local-only"
+
+    def test_user_wins_over_local_and_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.2.0+ acceptance: user config wins over both local config and env."""
+        user_path = tmp_path / "user_cfg" / "config.json"
+        user_path.parent.mkdir(parents=True, exist_ok=True)
+        user_path.write_text(json.dumps({"api_key": "user-wins"}), encoding="utf-8")
+        monkeypatch.setattr(config_mod, "_user_config_path", lambda: user_path)
+        # Local config + env var both set; user must still win.
+        local = tmp_path / "cwd"
+        local.mkdir()
+        (local / "config.json").write_text(
+            json.dumps({"api_key": "local-loses"}), encoding="utf-8"
+        )
+        monkeypatch.chdir(local)
+        monkeypatch.setenv("MINIMAX_API_KEY", "env-loses")
+        cfg = load_config()
+        assert cfg.api_key == "user-wins"
+
+    def test_local_wins_over_env_when_no_user(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.2.0+ acceptance: no user config + local + env → local wins."""
+        # conftest already isolates user config to an empty tmp file
+        local = tmp_path / "cwd"
+        local.mkdir()
+        (local / "config.json").write_text(
+            json.dumps({"api_key": "local-wins"}), encoding="utf-8"
+        )
+        monkeypatch.chdir(local)
+        monkeypatch.setenv("MINIMAX_API_KEY", "env-loses")
+        cfg = load_config()
+        assert cfg.api_key == "local-wins"
+
+    def test_env_fallback_when_no_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.2.0+ acceptance: no user / no local + env → env fallback."""
+        # conftest: user is isolated to empty tmp; cwd has no config.json.
+        empty = tmp_path / "no_config"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+        monkeypatch.setenv("MINIMAX_API_KEY", "env-only")
+        cfg = load_config()
+        assert cfg.api_key == "env-only"
+
+    def test_env_api_key_does_not_override_file_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.2.0+：MINIMAX_API_KEY 不再覆盖文件 api_key；UI 保存的 user
+        key 必须能跨进程持久化，且 env 仅在文件无 key 时兜底。base_url
+        仍然被 env 覆盖（不是 api_key 范畴）。"""
         local = tmp_path / "cwd"
         local.mkdir()
         (local / "config.json").write_text(
@@ -118,8 +185,37 @@ class TestLoadConfigFilePrecedence:
         monkeypatch.setenv("MINIMAX_API_KEY", "from-env")
         monkeypatch.setenv("MINIMAX_BASE_URL", "https://env")
         cfg = load_config()
-        assert cfg.api_key == "from-env"
+        # api_key：文件优先，env 不再覆盖
+        assert cfg.api_key == "from-file"
+        # base_url：env 仍然覆盖（行为不变）
         assert cfg.base_url == "https://env"
+
+    def test_env_api_key_overrides_when_no_file_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.1.7+：当 user/local 文件都没有 api_key 时，env 兜底生效。"""
+        # cwd 没有 config.json（conftest 已 chdir 到 tmp_path）；
+        # user config 被 conftest 隔离到一个空路径。
+        monkeypatch.setenv("MINIMAX_API_KEY", "just-env")
+        cfg = load_config()
+        assert cfg.api_key == "just-env"
+
+    def test_env_api_key_overridden_by_user_file_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """v0.1.7+：仅 user config 有 key、local 没有时，user key 覆盖 env。"""
+        user_cfg_dir = tmp_path / "user_only"
+        user_cfg_dir.mkdir(parents=True, exist_ok=True)
+        user_path = user_cfg_dir / "config.json"
+        user_path.write_text(json.dumps({"api_key": "user-only-key"}), encoding="utf-8")
+        monkeypatch.setattr(config_mod, "_user_config_path", lambda: user_path)
+        # cwd 无 config.json
+        empty = tmp_path / "no_local"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+        monkeypatch.setenv("MINIMAX_API_KEY", "from-env")
+        cfg = load_config()
+        assert cfg.api_key == "user-only-key"
 
     def test_env_only_no_files(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("MINIMAX_API_KEY", "just-env")
@@ -335,6 +431,9 @@ class TestModelRegistry:
             assert "resolutions" in c and len(c["resolutions"]) > 0
             assert "duration_min" in c and "duration_max" in c
             assert c["duration_min"] <= c["duration_max"]
+            # 新增能力字段
+            assert "modes" in c and len(c["modes"]) > 0
+            assert "i2v_roles" in c and len(c["i2v_roles"]) > 0
 
     def test_h3_max_excludes_2k(self) -> None:
         from minipic.config import MODEL_CONSTRAINTS
@@ -345,6 +444,25 @@ class TestModelRegistry:
         from minipic.config import MODEL_CONSTRAINTS
         assert MODEL_CONSTRAINTS["MiniMax-H3-Max"]["duration_min"] == 5
         assert MODEL_CONSTRAINTS["MiniMax-H3"]["duration_min"] == 4
+
+    def test_h3_modes_and_roles(self) -> None:
+        from minipic.config import MODEL_CONSTRAINTS
+        h3 = MODEL_CONSTRAINTS["MiniMax-H3"]
+        assert h3["modes"] == ["t2v", "i2v", "r2v"]
+        # 官方 API schema 的 role 枚举只有 first_frame / last_frame /
+        # reference_image / reference_video / reference_audio，没有 middle_frame；
+        # H3 与 H3-Max 已统一收紧为首/尾帧两角色。
+        assert h3["i2v_roles"] == ["first_frame", "last_frame"]
+        assert "middle_frame" not in h3["i2v_roles"]
+
+    def test_h3_max_modes_and_roles(self) -> None:
+        from minipic.config import MODEL_CONSTRAINTS
+        h3m = MODEL_CONSTRAINTS["MiniMax-H3-Max"]
+        assert h3m["modes"] == ["t2v", "i2v"]
+        # H3-Max 不支持 r2v 与中间帧
+        assert "r2v" not in h3m["modes"]
+        assert "middle_frame" not in h3m["i2v_roles"]
+        assert h3m["i2v_roles"] == ["first_frame", "last_frame"]
 
 
 class TestValidateModelParams:
@@ -398,3 +516,59 @@ class TestValidateModelParams:
             validate_model_params("MiniMax-H3-Max", resolution="2K")
         # H3-Max + 480P is fine
         validate_model_params("MiniMax-H3-Max", resolution="480P")
+
+
+# --------------------------------------------------------------------------- validate_model_modes
+class TestValidateModelModes:
+    def test_unknown_model_raises(self) -> None:
+        from minipic.config import validate_model_modes
+        with pytest.raises(_ConfigError, match="unsupported model"):
+            validate_model_modes("MiniMax-X9", mode="t2v")
+
+    def test_h3_three_modes_pass(self) -> None:
+        from minipic.config import validate_model_modes
+        for m in ("t2v", "i2v", "r2v"):
+            validate_model_modes("MiniMax-H3", mode=m)  # ok
+
+    def test_h3_first_and_last_frame_pass(self) -> None:
+        from minipic.config import validate_model_modes
+        # H3 支持首帧/尾帧（v0.1.6+：中间帧被 schema 收紧后已不再支持）
+        for r in ("first_frame", "last_frame"):
+            validate_model_modes("MiniMax-H3", mode="i2v", i2v_role=r)
+
+    def test_h3_rejects_middle_frame(self) -> None:
+        from minipic.config import validate_model_modes
+        with pytest.raises(_ConfigError, match="middle_frame"):
+            validate_model_modes("MiniMax-H3", mode="i2v", i2v_role="middle_frame")
+
+    def test_h3_max_rejects_middle_frame(self) -> None:
+        from minipic.config import validate_model_modes
+        with pytest.raises(_ConfigError, match="middle_frame"):
+            validate_model_modes("MiniMax-H3-Max", mode="i2v", i2v_role="middle_frame")
+
+    def test_h3_max_rejects_r2v_with_hint(self) -> None:
+        from minipic.config import validate_model_modes
+        with pytest.raises(_ConfigError) as ei:
+            validate_model_modes("MiniMax-H3-Max", mode="r2v")
+        msg = str(ei.value)
+        assert "MiniMax-H3-Max" in msg
+        assert "r2v" in msg
+        # 必须给出明确的回退提示
+        assert "不支持多模态参考" in msg
+        assert "MiniMax-H3" in msg
+
+    def test_h3_max_first_and_last_pass(self) -> None:
+        from minipic.config import validate_model_modes
+        validate_model_modes("MiniMax-H3-Max", mode="i2v", i2v_role="first_frame")
+        validate_model_modes("MiniMax-H3-Max", mode="i2v", i2v_role="last_frame")
+
+    def test_unknown_mode_rejected(self) -> None:
+        from minipic.config import validate_model_modes
+        with pytest.raises(_ConfigError, match="不支持模式"):
+            validate_model_modes("MiniMax-H3", mode="bogus")
+
+    def test_no_args_is_noop(self) -> None:
+        from minipic.config import validate_model_modes
+        # 不传 mode / i2v_role 时什么都不校验
+        validate_model_modes("MiniMax-H3")
+        validate_model_modes("MiniMax-H3-Max")

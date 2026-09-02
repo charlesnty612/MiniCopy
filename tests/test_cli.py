@@ -21,7 +21,6 @@ from click.testing import CliRunner
 
 from minipic import cli as cli_mod
 from minipic.cli import (
-    _atomic_download,
     _parse_ref,
     _print_task_record,
     _status_label,
@@ -79,6 +78,12 @@ class _FakeMiniMaxClient:
                           "content": [{"url": "https://cdn/v.mp4"}]}
         )
         self.upload_and_resolve = AsyncMock(return_value="https://cdn/uploaded")
+        # Context-IR defaults: empty enhanced prompt so tests that don't care
+        # can just assert "no rewrite happened" by checking create_video_task's
+        # received content. Tests that want the rewrite path set
+        # ``fetch_context_ir_prompt.return_value``.
+        self.create_context_ir_task = AsyncMock(return_value="ir-tid-default")
+        self.fetch_context_ir_prompt = AsyncMock(return_value="")
 
         async def _dl(url: str, dest: Path, **kwargs: Any) -> None:
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -444,7 +449,7 @@ class TestCreateR2V:
         v = tmp_path / "short.mp4"
         v.write_bytes(b"x")
 
-        async def fake_prep(source: Any, *, clips_spec: Any = None) -> list[VideoClip]:
+        async def fake_prep(source: Any) -> list[VideoClip]:
             return [VideoClip(path=source, start_seconds=0.0, duration_seconds=10.0, is_split=False)]
         # The CLI imports prepare_reference_video lazily inside _run, so
         # we patch it on the source module (minipic.media).
@@ -465,13 +470,21 @@ class TestCreateR2V:
 
     def test_with_ref_audios(
         self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient,
-        tmp_path: Path,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Use a local audio path to avoid the URL+colon parsing issue
         local_audio = tmp_path / "sound.mp3"
         local_audio.write_bytes(b"x")
         local_img = tmp_path / "img.jpg"
         local_img.write_bytes(b"x")
+        # v0.2.0+: build_content now also validates ref-audio via
+        # prepare_reference_audio (which calls ffprobe_duration). Stub the
+        # duration so we don't need a real mp3 / ffprobe on the test box.
+        from minipic.media import AudioClip
+        async def fake_prep(source: Any) -> list[AudioClip]:
+            return [AudioClip(path=source, start_seconds=0.0, duration_seconds=8.0, is_split=False)]
+        import minipic.media as media_mod
+        monkeypatch.setattr(media_mod, "prepare_reference_audio", fake_prep)
         fake_client.upload_and_resolve.return_value = "https://cdn/uploaded"
         fake_client.create_video_task.return_value = "tid-r2v"
         result = runner.invoke(main, [
@@ -485,6 +498,8 @@ class TestCreateR2V:
         audios = [c for c in content if c.get("type") == "audio_url"]
         assert len(audios) == 1
         assert audios[0]["audio_url"]["url"] == "https://cdn/uploaded"
+        # Audio clip duration is propagated to the content[] payload.
+        assert audios[0].get("duration") == 8.0
 
 
 # --------------------------------------------------------------------------- status command
@@ -632,11 +647,16 @@ class TestWebCommand:
         def fake_run(*args: Any, **kwargs: Any) -> None:
             called.append({"args": args, "kwargs": kwargs})
         monkeypatch.setattr(uvicorn, "run", fake_run)
-        result = runner.invoke(main, ["web", "--port", "9999"])
+        result = runner.invoke(main, ["web"])
         assert result.exit_code == 0
         assert len(called) == 1
-        # Verify the port was forwarded
-        assert called[0]["kwargs"].get("port") == 9999 or any("9999" in str(a) for a in called[0]["args"])
+        # Port is fixed at 7860 — no --port flag exists anymore.
+        kwargs = called[0]["kwargs"]
+        assert kwargs.get("port") == 7860
+        # --port must be rejected (not a known option).
+        result2 = runner.invoke(main, ["web", "--port", "9999"])
+        assert result2.exit_code != 0
+        assert "No such option" in result2.output
 
 
 # --------------------------------------------------------------------------- create --model
@@ -710,14 +730,13 @@ class TestCreateModelFlag:
         kwargs = fake_client.create_video_task.await_args.kwargs
         assert kwargs["model"] == "MiniMax-H3-Max"
 
-    def test_r2v_with_h3_max(
+    def test_r2v_with_h3_max_rejected(
         self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient,
         tmp_path: Path,
     ) -> None:
+        """H3-Max 不支持多模态参考（r2v），CLI 必须拒绝而不是提交到后端。"""
         img = tmp_path / "img.jpg"
         img.write_bytes(b"x")
-        fake_client.upload_and_resolve.return_value = "https://cdn/uploaded.jpg"
-        fake_client.create_video_task.return_value = "tid-r2v-max"
         result = runner.invoke(main, [
             "create", "r2v",
             "--prompt", "x",
@@ -725,11 +744,33 @@ class TestCreateModelFlag:
             "--model", "MiniMax-H3-Max",
             "--resolution", "480P", "--duration", "5",
         ])
+        assert result.exit_code != 0
+        assert "不支持模式 r2v" in result.output
+        assert "不支持多模态参考" in result.output
+        # 校验发生在提交前，fake client 不应被调用
+        assert fake_client.create_video_task.await_args is None
+
+    def test_r2v_with_h3(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient,
+        tmp_path: Path,
+    ) -> None:
+        """H3 支持多模态参考（r2v），model 参数应正确传给后端。"""
+        img = tmp_path / "img.jpg"
+        img.write_bytes(b"x")
+        fake_client.upload_and_resolve.return_value = "https://cdn/uploaded.jpg"
+        fake_client.create_video_task.return_value = "tid-r2v-h3"
+        result = runner.invoke(main, [
+            "create", "r2v",
+            "--prompt", "x",
+            "--ref-image", str(img),
+            "--model", "MiniMax-H3",
+            "--resolution", "768P", "--duration", "10",
+        ])
         assert result.exit_code == 0, result.output
         kwargs = fake_client.create_video_task.await_args.kwargs
-        assert kwargs["model"] == "MiniMax-H3-Max"
-        assert kwargs["resolution"] == "480P"
-        assert kwargs["duration"] == 5
+        assert kwargs["model"] == "MiniMax-H3"
+        assert kwargs["resolution"] == "768P"
+        assert kwargs["duration"] == 10
 
 
 # --------------------------------------------------------------------------- _print_task_record
@@ -780,38 +821,6 @@ class TestWaitAndDownload:
         assert "Failed" in str(ei.value)
 
 
-# --------------------------------------------------------------------------- _atomic_download
-class TestAtomicDownload:
-    def test_downloads_and_renames(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        async def fake_dl(url: str, dest: Path, **kwargs: Any) -> None:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(b"video-data")
-        client = MagicMock()
-        client.download_video = AsyncMock(side_effect=fake_dl)
-        dest = tmp_path / "out.mp4"
-        _atomic_download(client, "https://x", dest)
-        assert dest.is_file()
-        assert dest.read_bytes() == b"video-data"
-        # No .part leftover
-        assert not (tmp_path / "out.part").exists()
-
-    def test_removes_stale_part(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        async def fake_dl(url: str, dest: Path, **kwargs: Any) -> None:
-            dest.write_bytes(b"fresh")
-        client = MagicMock()
-        client.download_video = AsyncMock(side_effect=fake_dl)
-        # Pre-existing stale .part
-        stale = tmp_path / "out.part"
-        stale.write_bytes(b"old")
-        dest = tmp_path / "out.mp4"
-        _atomic_download(client, "https://x", dest)
-        assert dest.read_bytes() == b"fresh"
-
-
 # --------------------------------------------------------------------------- top-level error wrapper
 class TestCliErrorWrapper:
     def test_minipic_error_exits_2(self) -> None:
@@ -832,125 +841,129 @@ class TestCliErrorWrapper:
             assert ei.value.code == 1
 
 
+# --------------------------------------------------------------------------- Context-IR (CLI)
+class TestCliContextIR:
+    """CLI mirrors the Web layer's H3-Context-IR rewrite behavior.
+
+    All real network / API calls are mocked via AsyncMock — no MiniMax traffic.
+    """
+
+    def test_t2v_default_calls_context_ir_and_rewrites_text(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        fake_client.create_context_ir_task.return_value = "ir-tid"
+        fake_client.fetch_context_ir_prompt.return_value = "[H3-PROMPT]"
+        fake_client.create_video_task.return_value = "tid-1"
+
+        result = runner.invoke(main, [
+            "create", "t2v", "--prompt", "a cat", "--ratio", "16:9",
+        ])
+        assert result.exit_code == 0, result.output
+
+        # Context-IR was called with the t2v ratio (16:9).
+        ir_kwargs = fake_client.create_context_ir_task.await_args.kwargs
+        assert ir_kwargs["model"] == "MiniMax-H3"
+        assert ir_kwargs["ratio"] == "16:9"
+        # The real submit received the enhanced prompt in content[0]["text"].
+        submit_content = fake_client.create_video_task.await_args.kwargs["content"]
+        assert submit_content[0]["type"] == "text"
+        assert submit_content[0]["text"] == "[H3-PROMPT]"
+        # The user-facing success message is printed.
+        assert "Context-IR" in result.output
+
+    def test_t2v_no_context_ir_flag_skips_ir(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        fake_client.create_video_task.return_value = "tid-1"
+        result = runner.invoke(main, [
+            "create", "t2v",
+            "--prompt", "a cat",
+            "--ratio", "16:9",
+            "--no-context-ir",
+        ])
+        assert result.exit_code == 0, result.output
+        fake_client.create_context_ir_task.assert_not_called()
+        fake_client.fetch_context_ir_prompt.assert_not_called()
+        # Original prompt is preserved.
+        content = fake_client.create_video_task.await_args.kwargs["content"]
+        assert content[0]["text"] == "a cat"
+
+    def test_h3_max_skips_context_ir(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        fake_client.create_video_task.return_value = "tid-max"
+        result = runner.invoke(main, [
+            "create", "t2v",
+            "--prompt", "x",
+            "--ratio", "16:9",
+            "--model", "MiniMax-H3-Max",
+            "--duration", "10",
+        ])
+        assert result.exit_code == 0, result.output
+        # H3-Max: no IR call, no error.
+        fake_client.create_context_ir_task.assert_not_called()
+        fake_client.fetch_context_ir_prompt.assert_not_called()
+
+    def test_context_ir_failure_falls_back_to_original(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        fake_client.create_context_ir_task.return_value = "ir-tid"
+        fake_client.fetch_context_ir_prompt.side_effect = TimeoutError("ir stuck")
+        fake_client.create_video_task.return_value = "tid-1"
+
+        result = runner.invoke(main, [
+            "create", "t2v", "--prompt", "original prompt", "--ratio", "16:9",
+        ])
+        # Submission still succeeds; original prompt is kept.
+        assert result.exit_code == 0, result.output
+        content = fake_client.create_video_task.await_args.kwargs["content"]
+        assert content[0]["text"] == "original prompt"
+
+    def test_i2v_default_calls_context_ir_with_adaptive_ratio(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        fake_client.create_context_ir_task.return_value = "ir-tid"
+        fake_client.fetch_context_ir_prompt.return_value = "[H3-IR]"
+        fake_client.create_video_task.return_value = "tid-i2v"
+        result = runner.invoke(main, [
+            "create", "i2v",
+            "--prompt", "a scene",
+            "--ref-image", "https://cdn/first.jpg",
+        ])
+        assert result.exit_code == 0, result.output
+        # i2v forces ratio=adaptive for both IR and the real submit.
+        ir_kwargs = fake_client.create_context_ir_task.await_args.kwargs
+        assert ir_kwargs["ratio"] == "adaptive"
+        submit_kwargs = fake_client.create_video_task.await_args.kwargs
+        assert submit_kwargs["ratio"] == "adaptive"
+        assert submit_kwargs["content"][0]["text"] == "[H3-IR]"
+
+    def test_r2v_default_calls_context_ir(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient,
+        tmp_path: Path,
+    ) -> None:
+        local = tmp_path / "img.jpg"
+        local.write_bytes(b"x")
+        fake_client.upload_and_resolve.return_value = "https://cdn/uploaded.jpg"
+        fake_client.create_context_ir_task.return_value = "ir-tid"
+        fake_client.fetch_context_ir_prompt.return_value = "[H3-R2V]"
+        fake_client.create_video_task.return_value = "tid-r2v"
+        result = runner.invoke(main, [
+            "create", "r2v",
+            "--prompt", "x",
+            "--ref-image", str(local),
+        ])
+        assert result.exit_code == 0, result.output
+        ir_kwargs = fake_client.create_context_ir_task.await_args.kwargs
+        # r2v default ratio is "adaptive" so IR also gets "adaptive".
+        assert ir_kwargs["ratio"] == "adaptive"
+        submit_kwargs = fake_client.create_video_task.await_args.kwargs
+        assert submit_kwargs["content"][0]["text"] == "[H3-R2V]"
+
+
 # --------------------------------------------------------------------------- helpers
 def _strip_rich(s: str) -> str:
     """Strip ANSI escape codes from a rich-formatted string for JSON parsing."""
     import re
     return re.sub(r"\x1b\[[0-9;]*m", "", s)
-
-
-# ============================================================ v0.1.3b prepare / commit
-class TestPrepareCommandRegistration:
-    def test_prepare_in_help(self) -> None:
-        runner = CliRunner()
-        result = runner.invoke(cli_mod.main, ["--help"])
-        assert result.exit_code == 0
-        assert "prepare" in result.output
-        assert "commit" in result.output
-        assert "prepares" in result.output
-
-    def test_prepare_subcommands_listed(self) -> None:
-        runner = CliRunner()
-        result = runner.invoke(cli_mod.main, ["prepare", "--help"])
-        assert result.exit_code == 0
-        assert "t2v" in result.output
-        assert "i2v" in result.output
-        assert "r2v" in result.output
-
-    def test_prepare_t2v_requires_api_key(self) -> None:
-        runner = CliRunner()
-        with runner.isolated_filesystem():
-            result = runner.invoke(cli_mod.main, [
-                "prepare", "t2v", "--prompt", "x", "--ratio", "16:9",
-            ])
-        # Should fail because no API key is set in the test env
-        assert result.exit_code != 0
-
-
-class TestPrepareHelpers:
-    def test_build_body_from_args_minimal(self) -> None:
-        body = cli_mod._build_body_from_args(
-            "t2v", "hello", (), (), (), None, "16:9", "768P", "MiniMax-H3", True,
-        )
-        assert body["mode"] == "t2v"
-        assert body["prompt"] == "hello"
-        assert body["use_context_ir"] is True
-        assert body["ref_images"] == []
-
-    def test_build_body_from_args_with_refs(self) -> None:
-        body = cli_mod._build_body_from_args(
-            "r2v", "x",
-            ("img.jpg",), ("vid.mp4:reference_video",), (),
-            10, "16:9", "768P", "MiniMax-H3", False,
-        )
-        assert body["ref_images"] == [{"path": "img.jpg", "role": "reference_image"}]
-        assert body["ref_videos"] == [{"path": "vid.mp4", "role": "reference_video"}]
-        assert body["use_context_ir"] is False
-
-    def test_save_plan_persists(self) -> None:
-        from minipic.storage import init_db, get_prepare, cleanup_expired_prepares
-        from minipic.config import user_data_path
-        init_db()
-        cleanup_expired_prepares()
-        body = {"mode": "t2v", "prompt": "x", "ratio": "16:9"}
-        plan = {"content": [], "segments": [], "warnings": []}
-        pid = cli_mod._save_plan(body, plan)
-        rec = get_prepare(pid)
-        assert rec is not None
-        assert rec.status == "prepared"
-        assert rec.payload == body
-
-    def test_print_prepare_plan_does_not_crash(self) -> None:
-        plan = {
-            "estimated_segments": 2,
-            "segments": [
-                {"index": 0, "start_seconds": 0.0, "duration_seconds": 7},
-                {"index": 1, "start_seconds": 7.0, "duration_seconds": 11},
-            ],
-            "warnings": [],
-            "content_preview": [
-                {"type": "text", "text": "rewritten prompt"},
-                {"type": "video_url", "url": "https://cdn/clip.mp4", "duration": 7},
-            ],
-            "used_context_ir": True,
-            "context_ir_fallback": False,
-            "enhanced_prompt": "rewritten 6-section prompt",
-        }
-        # Should not raise
-        cli_mod._print_prepare_plan(plan)
-
-    def test_print_prepare_plan_with_fallback_warning(self) -> None:
-        plan = {
-            "estimated_segments": 1,
-            "segments": [],
-            "warnings": ["Context-IR fallback"],
-            "content_preview": [],
-            "used_context_ir": False,
-            "context_ir_fallback": True,
-            "context_ir_error": "[2013] TokenPlan",
-        }
-        cli_mod._print_prepare_plan(plan)
-
-
-class TestCommitCommand:
-    def test_commit_nonexistent_returns_error(self) -> None:
-        runner = CliRunner()
-        with runner.isolated_filesystem():
-            result = runner.invoke(cli_mod.main, [
-                "commit", "prep-does-not-exist",
-            ])
-        # Should exit with error code
-        assert result.exit_code != 0
-
-
-class TestListPreparesCommand:
-    def test_list_prepares_empty(self) -> None:
-        from minipic.storage import init_db, cleanup_expired_prepares
-        init_db()
-        cleanup_expired_prepares()
-        runner = CliRunner()
-        with runner.isolated_filesystem():
-            result = runner.invoke(cli_mod.main, ["prepares"])
-        assert result.exit_code == 0
-        assert "No active prepares" in result.output
 

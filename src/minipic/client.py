@@ -2,13 +2,13 @@
 
 Endpoints we use:
   - POST /v1/files/upload                 (upload a local file, get back file_id)
-  - GET  /v1/files/retrieve?file_id=...   (resolve a file_id to a CDN URL for V2 content[])
   - POST /v2/video_generation             (create a generation task, get back task_id)
   - GET  /v2/query/video_generation/{task_id}  (poll status, get back content.url on success)
 
-Why both V1 and V2: H3 V2 content[] only accepts public HTTPS URLs, not file_ids.
-We use the V1 file API to upload local files, then resolve to a CDN URL via
-GET /v1/files/retrieve before submitting the V2 task.
+Why both V1 and V2: H3 V2 content[] references uploaded files via the
+``mm_file://{file_id}`` URL scheme — no /v1/files/retrieve round trip is
+needed. We upload with the V1 file API and reference the returned file_id
+directly.
 
 Authentication: Bearer <api_key>.
 Retry policy: 1000 / 1001 / 1002 with bounded backoff. Other codes raise immediately.
@@ -37,10 +37,13 @@ log = logging.getLogger(__name__)
 
 # Endpoints (relative to base_url)
 EP_UPLOAD = "/v1/files/upload"
-EP_FILE_RETRIEVE = "/v1/files/retrieve"
 EP_CREATE_VIDEO = "/v2/video_generation"
 EP_QUERY_VIDEO = "/v2/query/video_generation/{task_id}"
 EP_CONTEXT_IR = "/v2/h3_context_ir"
+EP_IMAGE_GENERATION = "/v1/image_generation"
+
+# V2 content[] references uploaded files with this scheme: mm_file://{file_id}
+MM_FILE_PREFIX = "mm_file://"
 
 
 class MiniMaxClient:
@@ -105,26 +108,13 @@ class MiniMaxClient:
         return file_id
 
     async def resolve_file_url(self, file_id: str) -> str:
-        """Resolve a V1 file_id to a CDN URL usable in V2 content[]."""
-        resp = await self._request_with_retry(
-            "GET", EP_FILE_RETRIEVE, params={"file_id": file_id}
-        )
-        body = resp.json()
-        # V1 retrieve returns the file metadata; the URL may be in `file.download_url`,
-        # `file.url`, or `url` depending on schema version.
-        file_obj = body.get("file") or body
-        url = (
-            file_obj.get("download_url")
-            or file_obj.get("url")
-            or body.get("url")
-        )
-        if not url:
-            raise ConfigError(
-                f"file retrieve response missing URL: {body}\n"
-                f"Tip: if V1 retrieve does not return a URL, use --ref-image-url / "
-                f"--ref-video-url with a public HTTPS URL instead of a local file."
-            )
-        return url
+        """Return the V2 content[] URL reference for an uploaded file_id.
+
+        V2 content[] items accept ``mm_file://{file_id}`` to reference a file
+        that was uploaded via the V1 file API — no /v1/files/retrieve round
+        trip is needed (retrieve returns file metadata, not a CDN URL).
+        """
+        return f"mm_file://{file_id}"
 
     async def upload_and_resolve(self, path: Path) -> str:
         """Upload a local file and return the CDN URL. Convenience wrapper."""
@@ -162,6 +152,44 @@ class MiniMaxClient:
             raise ConfigError(f"submit response missing task_id: {body}")
         log.debug("submitted task %s", task_id)
         return task_id
+
+    # ---------------------------------------------------------------- image generation
+
+    async def generate_image(
+        self,
+        *,
+        prompt: str,
+        aspect_ratio: str = "16:9",
+        response_format: str = "url",
+        n: int = 1,
+        prompt_optimizer: bool = True,
+    ) -> list[str]:
+        """Generate one or more images via MiniMax image-01 (synchronous).
+
+        Returns a list of image URLs (``response_format="url"``) or base64
+        strings (``response_format="base64"``). URLs expire after 24 hours.
+        """
+        payload: dict[str, Any] = {
+            "model": "image-01",
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "response_format": response_format,
+            "n": n,
+            "prompt_optimizer": prompt_optimizer,
+        }
+        resp = await self._request_with_retry(
+            "POST", EP_IMAGE_GENERATION, json_body=payload
+        )
+        body = resp.json()
+        data = body.get("data") or {}
+        if response_format == "url":
+            urls = data.get("image_urls") or []
+        else:
+            urls = data.get("image_base64") or []
+        if not urls:
+            raise ConfigError(f"image generation response missing images: {body}")
+        log.debug("generated %d image(s)", len(urls))
+        return urls
 
     # ---------------------------------------------------------------- query
 
@@ -226,12 +254,15 @@ class MiniMaxClient:
         log.debug("context-ir task %s", task_id)
         return task_id
 
-    async def fetch_context_ir_prompt(self, task_id: str, *, max_wait_seconds: float = 1800.0) -> str:
+    async def fetch_context_ir_prompt(self, task_id: str, *, max_wait_seconds: float = 90.0) -> str:
         """Poll a Context-IR task until terminal, then return content.prompt.
 
-        Context-IR typically completes in under a minute; we cap at 30 min
-        for safety. Loops internally because the success payload lives at
-        `task.content.prompt` (string) instead of `task.content.url`.
+        Context-IR typically completes in under a minute; we cap at 90s so
+        that a stuck Context-IR call doesn't block submission of the real
+        generation task. Callers wanting longer waits can pass an explicit
+        ``max_wait_seconds``. Loops internally because the success payload
+        lives at ``task.content.prompt`` (string) instead of
+        ``task.content.url``.
         """
         interval = max(5.0, float(self.cfg.poll_interval_seconds))
         elapsed = 0.0

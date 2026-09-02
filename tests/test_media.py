@@ -1,4 +1,4 @@
-"""Tests for minipic.media — ffmpeg discovery, video splitting, reference resolution."""
+"""Tests for minipic.media — ffmpeg discovery, reference resolution, ref-video validation."""
 
 from __future__ import annotations
 
@@ -6,31 +6,19 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import ANY, patch
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from minipic.media import (
-    REF_VIDEO_CLIP_LEN_AUTO,
-    REF_VIDEO_MAX_CLIPS,
     REF_VIDEO_MAX_DURATION,
     REF_VIDEO_MIN_DURATION,
-    REF_VIDEO_TOTAL_BUDGET,
-    SEGMENT_BOUNDARY_WINDOW,
-    SEGMENT_MAX_COUNT,
-    SEGMENT_MAX_SECONDS,
-    SEGMENT_MIN_SECONDS,
-    SEGMENT_SCENE_THRESHOLDS,
-    SegmentSpec,
     VideoClip,
-    _auto_sample_clips,
-    _parse_clips_spec,
-    concat_videos,
-    extract_reference_clips,
+    build_content,
+    download_task_result,
     ffprobe_duration,
     find_ffmpeg,
-    find_shot_boundaries,
-    plan_segments,
     prepare_reference_video,
     resolve_reference,
 )
@@ -112,82 +100,6 @@ class TestFfprobeDuration:
                 ffprobe_duration(tmp_path / "nonexistent.mp4")
 
 
-# --------------------------------------------------------------------------- _parse_clips_spec
-class TestParseClipsSpec:
-    def test_empty_spec_returns_empty(self) -> None:
-        assert _parse_clips_spec("", source_duration=30.0) == []
-
-    def test_parses_single_clip(self) -> None:
-        clips = _parse_clips_spec("0:5", source_duration=10.0)
-        assert len(clips) == 1
-        assert clips[0].start_seconds == 0.0
-        assert clips[0].duration_seconds == 5.0
-
-    def test_parses_float_values(self) -> None:
-        clips = _parse_clips_spec("1.5:3.2", source_duration=10.0)
-        assert clips[0].start_seconds == pytest.approx(1.5)
-        assert clips[0].duration_seconds == pytest.approx(3.2)
-
-    def test_parses_multiple_clips(self) -> None:
-        clips = _parse_clips_spec("0:5,5:3,8:2", source_duration=15.0)
-        assert len(clips) == 3
-        assert clips[0].start_seconds == 0.0
-        assert clips[1].start_seconds == 5.0
-        assert clips[2].start_seconds == 8.0
-
-    def test_rejects_bad_format(self) -> None:
-        with pytest.raises(MediaError, match="must be 'start:duration'"):
-            _parse_clips_spec("bad", source_duration=10.0)
-
-    def test_rejects_non_numeric(self) -> None:
-        with pytest.raises(MediaError, match="must be numeric"):
-            _parse_clips_spec("a:b", source_duration=10.0)
-
-    def test_rejects_clip_too_short(self) -> None:
-        with pytest.raises(MediaError, match="out of range"):
-            _parse_clips_spec("0:1", source_duration=10.0)
-
-    def test_rejects_clip_too_long(self) -> None:
-        with pytest.raises(MediaError, match="out of range"):
-            _parse_clips_spec("0:20", source_duration=30.0)
-
-    def test_rejects_clip_extending_past_source(self) -> None:
-        with pytest.raises(MediaError, match="extends past source"):
-            _parse_clips_spec("8:5", source_duration=10.0)
-
-    def test_rejects_too_many_clips(self) -> None:
-        spec = ",".join(f"{i}:5" for i in range(REF_VIDEO_MAX_CLIPS + 1))
-        with pytest.raises(MediaError, match="too many clips"):
-            _parse_clips_spec(spec, source_duration=30.0)
-
-    def test_rejects_total_exceeds_budget(self) -> None:
-        with pytest.raises(MediaError, match="total clip duration"):
-            _parse_clips_spec("0:10,10:10", source_duration=30.0)
-
-    def test_allows_total_at_budget_boundary(self) -> None:
-        clips = _parse_clips_spec(f"0:{REF_VIDEO_TOTAL_BUDGET}", source_duration=REF_VIDEO_TOTAL_BUDGET + 1)
-        assert len(clips) == 1
-
-
-# --------------------------------------------------------------------------- _auto_sample_clips
-class TestAutoSampleClips:
-    def test_short_video_single_clip(self) -> None:
-        # For ≤15s, the function returns a single clip of the full duration.
-        clips = _auto_sample_clips(10.0)
-        assert len(clips) == 1
-        assert clips[0].start_seconds == 0.0
-        assert clips[0].duration_seconds == pytest.approx(10.0)
-
-    def test_auto_sample_respects_max_clips(self) -> None:
-        clips = _auto_sample_clips(60.0)
-        assert len(clips) <= REF_VIDEO_MAX_CLIPS
-
-    def test_clips_within_budget(self) -> None:
-        clips = _auto_sample_clips(30.0)
-        total = sum(c.duration_seconds for c in clips)
-        assert total <= REF_VIDEO_TOTAL_BUDGET + 0.1
-
-
 # --------------------------------------------------------------------------- VideoClip
 class TestVideoClip:
     def test_label_format(self) -> None:
@@ -209,52 +121,52 @@ class TestPrepareReferenceVideo:
         assert clips[0].path == video
 
     @pytest.mark.asyncio
-    async def test_long_video_auto_sampled(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        import minipic.media as media_mod
+    async def test_exactly_at_cap_returns_single_clip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A video exactly at the 15s cap is accepted (boundary)."""
+        video = tmp_path / "edge.mp4"
+        video.write_bytes(b"f")
+        monkeypatch.setattr("minipic.media.ffprobe_duration", lambda p: 15.0)
+        clips = await prepare_reference_video(video)
+        assert len(clips) == 1
+        assert clips[0].path == video
+        assert clips[0].duration_seconds == pytest.approx(15.0)
 
+    @pytest.mark.asyncio
+    async def test_long_video_rejected_with_chinese_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A video >15s raises MediaError with the Chinese user-facing message.
+
+        v0.1.5+: multi-segment generation was removed; the user must pre-trim
+        their footage with ffmpeg before submitting.
+        """
         video = tmp_path / "long.mp4"
         video.write_bytes(b"f")
-        monkeypatch.setattr(media_mod, "ffprobe_duration", lambda p: 60.0)
-        monkeypatch.setattr(media_mod, "find_ffmpeg", lambda: "ffmpeg")
+        monkeypatch.setattr("minipic.media.ffprobe_duration", lambda p: 17.77)
+        with pytest.raises(MediaError) as ei:
+            await prepare_reference_video(video)
+        msg = str(ei.value)
+        assert "超过 H3 上限 15s" in msg
+        assert "多段生成已移除" in msg
+        assert "ffmpeg" in msg
 
-        # Patch asyncio.to_thread so it runs synchronously
-        async def _sync_to_thread(fn, *a, **k):
-            return fn(*a, **k)
-        monkeypatch.setattr(media_mod.asyncio, "to_thread", _sync_to_thread)
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = None
-            clips = await prepare_reference_video(video)
-
-        assert len(clips) <= REF_VIDEO_MAX_CLIPS
-        assert all(c.is_split for c in clips)
+    @pytest.mark.asyncio
+    async def test_long_video_rejected_just_over_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Anything past the 15.05s tolerance is rejected."""
+        video = tmp_path / "just_over.mp4"
+        video.write_bytes(b"f")
+        monkeypatch.setattr("minipic.media.ffprobe_duration", lambda p: 15.5)
+        with pytest.raises(MediaError, match="超过 H3 上限 15s"):
+            await prepare_reference_video(video)
 
     @pytest.mark.asyncio
     async def test_raises_on_missing_file(self, tmp_path: Path) -> None:
         with pytest.raises(MediaError, match="video not found"):
             await prepare_reference_video(tmp_path / "nonexistent.mp4")
-
-    @pytest.mark.asyncio
-    async def test_long_video_with_clips_spec(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        import minipic.media as media_mod
-
-        video = tmp_path / "long.mp4"
-        video.write_bytes(b"f")
-        monkeypatch.setattr(media_mod, "ffprobe_duration", lambda p: 60.0)
-        monkeypatch.setattr(media_mod, "find_ffmpeg", lambda: "ffmpeg")
-
-        async def _sync_to_thread(fn, *a, **k):
-            return fn(*a, **k)
-        monkeypatch.setattr(media_mod.asyncio, "to_thread", _sync_to_thread)
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = None
-            clips = await prepare_reference_video(video, clips_spec="0:5,10:5,20:5")
-
-        assert len(clips) == 3
-        assert clips[0].start_seconds == 0.0
-        assert clips[1].start_seconds == 10.0
-        assert clips[2].start_seconds == 20.0
 
 
 # --------------------------------------------------------------------------- resolve_reference
@@ -319,319 +231,174 @@ class TestResolveReference:
 
 # --------------------------------------------------------------------------- constants
 class TestMediaConstants:
-    def test_clip_limits(self) -> None:
+    def test_ref_video_limits(self) -> None:
         assert REF_VIDEO_MIN_DURATION == 2.0
         assert REF_VIDEO_MAX_DURATION == 15.0
-        assert REF_VIDEO_MAX_CLIPS == 3
-        assert REF_VIDEO_TOTAL_BUDGET == 15.0
-        assert REF_VIDEO_CLIP_LEN_AUTO == 5.0
-
-    def test_segment_limits(self) -> None:
-        assert SEGMENT_MIN_SECONDS == 4
-        assert SEGMENT_MAX_SECONDS == 15
-        assert SEGMENT_MAX_COUNT == 4
-        assert SEGMENT_BOUNDARY_WINDOW == 3.0
-        assert SEGMENT_SCENE_THRESHOLDS == (0.4, 0.3, 0.5)
 
 
-# ============================================================ v0.1.3b SegmentSpec
-class TestSegmentSpec:
-    def test_end_seconds(self) -> None:
-        s = SegmentSpec(start_seconds=2.5, duration_seconds=7)
-        assert s.end_seconds() == 9.5
+# --------------------------------------------------------------------------- build_content
+class TestBuildContent:
+    """build_content is the single source of truth for the V2 content[] shape
+    used by both CLI and Web. These tests guard against the previous drift
+    (CLI accidentally nesting text, Web using the right shape — same call site
+    today).
+    """
 
-    def test_label_contains_range_and_duration(self) -> None:
-        s = SegmentSpec(start_seconds=0.0, duration_seconds=10)
-        label = s.label()
-        assert "0.00" in label
-        assert "10.00" in label
-        assert "10s" in label
+    @pytest.mark.asyncio
+    async def test_t2v_emits_only_text(self) -> None:
+        # T2V: no references — content[] is just the text item, flat string.
+        client = object()  # not touched for text-only
+        content = await build_content(prompt="a cat", client=client)  # type: ignore[arg-type]
+        assert content == [{"type": "text", "text": "a cat"}]
+        # Crucial: text is NOT nested.
+        assert not isinstance(content[0]["text"], dict)
 
+    @pytest.mark.asyncio
+    async def test_text_is_never_nested(self) -> None:
+        """Regression guard: the old CLI bug was ``{"text": {"text": ...}}``.
 
-# ============================================================ v0.1.3b plan_segments
-class TestPlanSegments:
-    def test_short_video_single_segment(self) -> None:
-        segs = plan_segments(5.0, boundaries=[])
-        assert len(segs) == 1
-        assert segs[0].start_seconds == 0.0
-        assert segs[0].duration_seconds == 5
+        This asserts the official flat shape is what the shared builder emits.
+        """
+        client = object()
+        content = await build_content(prompt="hello world", client=client)  # type: ignore[arg-type]
+        assert content[0]["type"] == "text"
+        assert content[0]["text"] == "hello world"
+        assert "text" not in content[0] or not isinstance(content[0]["text"], dict)
 
-    def test_exactly_at_max_returns_single(self) -> None:
-        segs = plan_segments(15.0, boundaries=[])
-        assert len(segs) == 1
-        assert segs[0].duration_seconds == 15
-
-    def test_just_over_max_returns_two(self) -> None:
-        segs = plan_segments(16.0, boundaries=[])
-        assert len(segs) == 2
-        assert sum(s.duration_seconds for s in segs) >= 16
-
-    def test_30s_returns_two_15s(self) -> None:
-        segs = plan_segments(30.0, boundaries=[])
-        assert len(segs) == 2
-        assert [s.duration_seconds for s in segs] == [15, 15]
-
-    def test_60s_returns_four_15s(self) -> None:
-        segs = plan_segments(60.0, boundaries=[])
-        assert len(segs) == 4
-        assert [s.duration_seconds for s in segs] == [15, 15, 15, 15]
-
-    def test_over_60s_raises(self) -> None:
-        with pytest.raises(MediaError, match="would need 5 segments"):
-            plan_segments(61.0, boundaries=[])
-        with pytest.raises(MediaError, match="max 4"):
-            plan_segments(70.0, boundaries=[])
-
-    def test_zero_or_negative_duration_raises(self) -> None:
-        with pytest.raises(MediaError, match="must be > 0"):
-            plan_segments(0.0, boundaries=[])
-
-    def test_uses_nearest_shot_boundary(self) -> None:
-        # 17.77s reference with 7.03 boundary — should split into 7+11
-        boundaries = [0.1, 2.93, 7.03, 11.53, 12.33, 16.57]
-        segs = plan_segments(17.77, boundaries=boundaries)
-        assert len(segs) == 2
-        assert segs[0].duration_seconds == 7
-        assert segs[1].duration_seconds == 11
-        assert segs[1].start_seconds == 7.03 or segs[1].start_seconds == 7
-
-    def test_falls_back_to_even_split_without_boundaries(self) -> None:
-        segs = plan_segments(17.77, boundaries=[])
-        assert len(segs) == 2
-        total = sum(s.duration_seconds for s in segs)
-        # Even split rounds to 9+9=18; total ≥ ref duration is acceptable
-        assert total == 18
-        assert segs[0].start_seconds == 0.0
-        assert segs[1].start_seconds == 9.0
-
-    def test_segment_duration_clamped_to_min(self) -> None:
-        # Very short between boundaries forces clamping up to min
-        # 20s with two boundaries very close together (1s apart) — first cut near ideal
-        boundaries = [0.0, 1.0, 19.0]
-        segs = plan_segments(20.0, boundaries=boundaries)
-        for s in segs:
-            assert s.duration_seconds >= SEGMENT_MIN_SECONDS
-
-    def test_segments_have_sequential_starts(self) -> None:
-        segs = plan_segments(45.0, boundaries=[])
-        for prev, cur in zip(segs, segs[1:]):
-            assert cur.start_seconds == pytest.approx(prev.start_seconds + prev.duration_seconds, abs=0.5)
-
-    def test_segments_use_integer_durations(self) -> None:
-        segs = plan_segments(33.0, boundaries=[5.0, 12.0, 20.0, 28.0])
-        for s in segs:
-            assert isinstance(s.duration_seconds, int)
-            assert SEGMENT_MIN_SECONDS <= s.duration_seconds <= SEGMENT_MAX_SECONDS
-
-
-# ============================================================ v0.1.3b find_shot_boundaries
-class TestFindShotBoundaries:
-    def test_returns_empty_for_missing_file(self, tmp_path: Path) -> None:
-        with pytest.raises(MediaError, match="video not found"):
-            find_shot_boundaries(tmp_path / "nope.mp4")
-
-    def test_parses_pts_time_from_stderr(self, tmp_path: Path) -> None:
-        import minipic.media as media_mod
-        video = tmp_path / "v.mp4"
-        video.write_bytes(b"f")
-        monkey_stderr = (
-            "frame=1\n"
-            "[Parsed_showinfo] n:0 pts:123 pts_time:0.500000 pos:0\n"
-            "[Parsed_showinfo] n:1 pts:456 pts_time:2.930000 pos:0\n"
-            "[Parsed_showinfo] n:2 pts:789 pts_time:7.030000 pos:0\n"
-            "[Parsed_showinfo] n:3 pts:999 pts_time:11.530000 pos:0\n"
-            "[Parsed_showinfo] n:4 pts:1111 pts_time:12.330000 pos:0\n"
-            "frame=6\n"
+    @pytest.mark.asyncio
+    async def test_i2v_first_frame_image_passed_through(self) -> None:
+        client = object()
+        content = await build_content(
+            prompt="a scene",
+            client=client,  # type: ignore[arg-type]
+            ref_images=[{"path": "https://cdn/first.jpg", "role": "first_frame"}],
         )
-        # 5 boundaries = within [3, 20] → first threshold (0.4) wins
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=["ffmpeg"], returncode=0, stdout="", stderr=monkey_stderr,
-            )
-            result = find_shot_boundaries(video)
-        assert result == [0.5, 2.93, 7.03, 11.53, 12.33]
+        assert content[0] == {"type": "text", "text": "a scene"}
+        img = content[1]
+        assert img["type"] == "image_url"
+        assert img["image_url"]["url"] == "https://cdn/first.jpg"
+        assert img["role"] == "first_frame"
 
-    def test_adaptive_threshold_falls_back(self, tmp_path: Path) -> None:
-        import minipic.media as media_mod
-        video = tmp_path / "v.mp4"
-        video.write_bytes(b"f")
-        # Too few boundaries for all three thresholds → empty list returned
-        too_few = "[Parsed_showinfo] n:0 pts:0 pts_time:1.000000 pos:0\n"
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=["ffmpeg"], returncode=0, stdout="", stderr=too_few,
-            )
-            result = find_shot_boundaries(video)
-        assert result == []
-
-    def test_too_many_boundaries_skipped(self, tmp_path: Path) -> None:
-        video = tmp_path / "v.mp4"
-        video.write_bytes(b"f")
-        # 25 boundaries > max_count=20 → skip
-        too_many = "\n".join(
-            f"[Parsed_showinfo] n:{i} pts:0 pts_time:{i}.000 pos:0" for i in range(25)
-        )
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=["ffmpeg"], returncode=0, stdout="", stderr=too_many,
-            )
-            result = find_shot_boundaries(video)
-        assert result == []
-
-    def test_timeout_returns_empty(self, tmp_path: Path) -> None:
-        video = tmp_path / "v.mp4"
-        video.write_bytes(b"f")
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("ffmpeg", 60)):
-            result = find_shot_boundaries(video)
-        assert result == []
-
-
-# ============================================================ v0.1.3b extract_reference_clips
-class TestExtractReferenceClips:
     @pytest.mark.asyncio
-    async def test_creates_one_clip_per_segment(
+    async def test_r2v_video_carries_duration(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import minipic.media as media_mod
-
-        source = tmp_path / "source.mp4"
-        source.write_bytes(b"f")
-        monkeypatch.setattr(media_mod, "find_ffmpeg", lambda: "ffmpeg")
-
-        async def _sync_to_thread(fn, *a, **k):
-            return fn(*a, **k)
-        monkeypatch.setattr(media_mod.asyncio, "to_thread", _sync_to_thread)
-
-        # ffmpeg mock: write a placeholder file at the output path
-        def fake_ffmpeg(*args, **kwargs):
-            out = args[0][-1]
-            Path(out).parent.mkdir(parents=True, exist_ok=True)
-            Path(out).write_bytes(b"clip-bytes")
-            return None
-
-        with patch("subprocess.run", side_effect=fake_ffmpeg):
-            segments = [
-                SegmentSpec(start_seconds=0.0, duration_seconds=7),
-                SegmentSpec(start_seconds=7.0, duration_seconds=11),
-            ]
-            out = await extract_reference_clips(source, segments)
-
-        assert len(out) == 2
-        for p in out:
-            assert p.is_file()
-            assert p.suffix == ".mp4"
-
-    @pytest.mark.asyncio
-    async def test_skips_reencoding_when_cached(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import minipic.media as media_mod
-
-        source = tmp_path / "source.mp4"
-        source.write_bytes(b"f")
-        monkeypatch.setattr(media_mod, "find_ffmpeg", lambda: "ffmpeg")
-
-        # The autouse _isolate_user_data fixture points user_data_path to
-        # tmp_path/"user_data" so we can pre-create the cached file there.
-        clip_dir = tmp_path / "user_data" / "clips" / source.stem
-        clip_dir.mkdir(parents=True, exist_ok=True)
-        cached = clip_dir / "clip_00_t0000_d0007.mp4"
-        cached.write_bytes(b"pre-existing")
-
-        with patch("subprocess.run") as mock_run:
-            segments = [SegmentSpec(start_seconds=0.0, duration_seconds=7)]
-            out = await extract_reference_clips(source, segments)
-        assert mock_run.call_count == 0
-        assert out[0] == cached
-
-    @pytest.mark.asyncio
-    async def test_ffmpeg_failure_raises_media_error(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import minipic.media as media_mod
-
-        source = tmp_path / "source.mp4"
-        source.write_bytes(b"f")
-        monkeypatch.setattr(media_mod, "find_ffmpeg", lambda: "ffmpeg")
-
-        async def _sync_to_thread(fn, *a, **k):
-            return fn(*a, **k)
-        monkeypatch.setattr(media_mod.asyncio, "to_thread", _sync_to_thread)
-
-        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "ffmpeg")):
-            with pytest.raises(MediaError, match="ffmpeg extract failed"):
-                await extract_reference_clips(
-                    source, [SegmentSpec(start_seconds=0.0, duration_seconds=7)]
-                )
-
-    @pytest.mark.asyncio
-    async def test_missing_source_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(MediaError, match="video not found"):
-            await extract_reference_clips(
-                tmp_path / "nope.mp4", [SegmentSpec(0.0, 7)]
-            )
-
-    @pytest.mark.asyncio
-    async def test_empty_segments_raises(self, tmp_path: Path) -> None:
-        # File must exist; otherwise the missing-source check fires first.
+        # Local video → prepare_reference_video (stubbed) → resolve_reference (stubbed)
         v = tmp_path / "v.mp4"
-        v.write_bytes(b"f")
-        with pytest.raises(MediaError, match="segments is empty"):
-            await extract_reference_clips(v, [])
+        v.write_bytes(b"x")
+        from minipic.media import VideoClip
 
+        async def fake_prep(source: Any) -> list[VideoClip]:
+            return [VideoClip(path=source, start_seconds=0.0,
+                              duration_seconds=10.0, is_split=False)]
+        monkeypatch.setattr("minipic.media.prepare_reference_video", fake_prep)
 
-# ============================================================ v0.1.3b concat_videos
-class TestConcatVideos:
-    def test_empty_input_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(MediaError, match="clip_paths is empty"):
-            concat_videos([], tmp_path / "out.mp4")
+        class FakeClient:
+            async def upload_and_resolve(self, p: Path) -> str:
+                return f"https://cdn/{p.name}"
+        content = await build_content(
+            prompt="x",
+            client=FakeClient(),  # type: ignore[arg-type]
+            ref_videos=[{"path": str(v)}],
+        )
+        vid = [c for c in content if c.get("type") == "video_url"][0]
+        assert vid["video_url"]["url"] == f"https://cdn/{v.name}"
+        assert vid["role"] == "reference_video"
+        assert vid["duration"] == 10.0
 
-    def test_single_clip_just_copies(self, tmp_path: Path) -> None:
-        src = tmp_path / "in.mp4"
-        src.write_bytes(b"hello")
-        out = tmp_path / "out.mp4"
-        result = concat_videos([src], out)
-        assert result == out
-        assert out.is_file()
-        assert out.read_bytes() == b"hello"
+    @pytest.mark.asyncio
+    async def test_remote_url_passes_through_without_upload(self) -> None:
+        # A remote URL must NOT trigger an upload — both for image and video.
+        class FakeClient:
+            called: list[Any] = []
+            async def upload_and_resolve(self, p: Path) -> str:
+                raise AssertionError("should not be called for remote URLs")
 
-    def test_concatenates_two_clips(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        import minipic.media as media_mod
-        monkeypatch.setattr(media_mod, "find_ffmpeg", lambda: "ffmpeg")
+        content = await build_content(
+            prompt="x",
+            client=FakeClient(),  # type: ignore[arg-type]
+            ref_images=[{"path": "https://cdn/a.jpg"}],
+            ref_videos=[{"path": "https://cdn/v.mp4"}],
+        )
+        # 1 text + 1 image + 1 video = 3 items
+        assert len(content) == 3
+        img = [c for c in content if c.get("type") == "image_url"][0]
+        vid = [c for c in content if c.get("type") == "video_url"][0]
+        assert img["image_url"]["url"] == "https://cdn/a.jpg"
+        assert vid["video_url"]["url"] == "https://cdn/v.mp4"
+        # Remote video has no duration (only local clips carry it).
+        assert "duration" not in vid
 
-        c1 = tmp_path / "c1.mp4"
-        c2 = tmp_path / "c2.mp4"
-        c1.write_bytes(b"a")
-        c2.write_bytes(b"b")
-        out = tmp_path / "out.mp4"
-
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = None
-            result = concat_videos([c1, c2], out)
-
-        assert result == out
-        assert mock_run.call_count == 1
-        # list_file should be cleaned up
-        assert not (tmp_path / "out.mp4.concat.txt").exists()
-        # The ffmpeg command should reference the list file
-        cmd = mock_run.call_args[0][0]
-        assert "-f" in cmd and "concat" in cmd
-
-    def test_concat_failure_raises_media_error(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.asyncio
+    async def test_local_image_resolved_via_upload(
+        self, tmp_path: Path
     ) -> None:
-        import minipic.media as media_mod
-        monkeypatch.setattr(media_mod, "find_ffmpeg", lambda: "ffmpeg")
+        img = tmp_path / "img.jpg"
+        img.write_bytes(b"x")
 
-        c1 = tmp_path / "c1.mp4"
-        c2 = tmp_path / "c2.mp4"
-        c1.write_bytes(b"a")
-        c2.write_bytes(b"b")
+        class FakeClient:
+            async def upload_and_resolve(self, p: Path) -> str:
+                return "https://cdn/uploaded.jpg"
+        content = await build_content(
+            prompt="x",
+            client=FakeClient(),  # type: ignore[arg-type]
+            ref_images=[{"path": str(img), "role": "reference_image"}],
+        )
+        img_item = [c for c in content if c.get("type") == "image_url"][0]
+        assert img_item["image_url"]["url"] == "https://cdn/uploaded.jpg"
+        assert img_item["role"] == "reference_image"
+
+
+# --------------------------------------------------------------------------- download_task_result
+class TestDownloadTaskResult:
+    @pytest.mark.asyncio
+    async def test_no_url_returns_false(self, tmp_path: Path) -> None:
+        # A succeeded task with no content → silent False, no download attempted.
+        client = MagicMock()
+        ok = await download_task_result(
+            client, {"content": []}, tmp_path / "out.mp4"  # type: ignore[arg-type]
+        )
+        assert ok is False
+        # download_video must NOT have been called.
+        client.download_video.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_extracts_url_from_content_and_downloads(
+        self, tmp_path: Path
+    ) -> None:
+        async def fake_dl(url: str, dest: Path) -> None:
+            dest.write_bytes(b"mp4-bytes")
+        client = MagicMock()
+        client.download_video = AsyncMock(side_effect=fake_dl)
+        task = {"content": [{"url": "https://cdn/v.mp4"}]}
+        ok = await download_task_result(
+            client, task, tmp_path / "out.mp4"  # type: ignore[arg-type]
+        )
+        assert ok is True
         out = tmp_path / "out.mp4"
+        assert out.is_file()
+        assert out.read_bytes() == b"mp4-bytes"
+        # Atomic via .tmp + rename — no leftover .tmp
+        assert not (tmp_path / "out.tmp").exists()
+        client.download_video.assert_awaited_once()
+        # The first arg to download_video must be the extracted URL.
+        args = client.download_video.await_args.args
+        assert args[0] == "https://cdn/v.mp4"
 
-        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, "ffmpeg")):
-            with pytest.raises(MediaError, match="ffmpeg concat failed"):
-                concat_videos([c1, c2], out)
-        # list_file should still be cleaned up
-        assert not (tmp_path / "out.mp4.concat.txt").exists()
+    @pytest.mark.asyncio
+    async def test_falls_back_to_legacy_type_video_entry(
+        self, tmp_path: Path
+    ) -> None:
+        """Older API shape: content[i] has type='video' with nested video.url."""
+        async def fake_dl(url: str, dest: Path) -> None:
+            dest.write_bytes(b"x")
+        client = MagicMock()
+        client.download_video = AsyncMock(side_effect=fake_dl)
+        task = {"content": [{"type": "video", "video": {"url": "https://cdn/legacy.mp4"}}]}
+        ok = await download_task_result(
+            client, task, tmp_path / "out.mp4"  # type: ignore[arg-type]
+        )
+        assert ok is True
+        client.download_video.assert_awaited_once()
+        assert client.download_video.await_args.args[0] == "https://cdn/legacy.mp4"
 

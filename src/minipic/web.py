@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -22,66 +22,78 @@ from .config import (
     MODEL_CONSTRAINTS,
     Config,
     _user_config_path,
-    _user_data_dir,
     load_config,
     mask_key,
     require_api_key,
     save_config,
     user_data_path,
+    validate_model_modes,
     validate_model_params,
 )
 from .client import MiniMaxClient
-from .errors import ConfigError, MediaError, MiniPicError, TaskError
+from .errors import ConfigError, MiniPicError, TaskError
 from .media import (
-    REF_VIDEO_MAX_DURATION,
-    extract_reference_clips,
+    _extract_video_url,
+    build_content,
+    download_task_result,
     ffprobe_duration,
-    find_shot_boundaries,
-    plan_segments,
-    prepare_reference_video,
     resolve_reference,
-    SegmentSpec,
 )
-from .poller import poll_until_done, STATUS_SUCCEEDED
+from .poller import TERMINAL_STATES, poll_until_done
 from .storage import (
-    PREPARE_STATUS_COMMITTED,
-    PREPARE_STATUS_PREPARED,
-    PREPARE_TTL_MS,
-    PrepareRecord,
     TaskRecord,
-    cleanup_expired_prepares,
-    cleanup_expired_uploads,
-    delete_prepare,
-    get_prepare,
     get_task,
-    insert_prepare,
     insert_task,
-    list_prepares,
     list_tasks,
-    update_prepare_status,
     update_task,
 )
-from . import media as _media_module
 
 log = logging.getLogger(__name__)
 
+
+def _web_dir() -> Path:
+    """定位 web/ 静态资源目录。
+
+    源码运行：项目根下的 web/。
+    PyInstaller 冻结后：web/ 通过 --add-data 打进 bundle，运行时根为 sys._MEIPASS。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "web"
+    return Path(__file__).parent.parent.parent / "web"
+
+
 # ---------------------------------------------------------------------------
-# v0.1.4 — upload allow-list + size cap
+# v0.1.4+ — upload allow-list + per-kind size caps (对齐 MiniMax V2 API 文档)
 # ---------------------------------------------------------------------------
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 与文案 "≤50MB" 对齐 (web.py:172 错误提示一致)
-_ALLOWED_IMAGE_MIME = {"image/png", "image/jpeg", "image/webp"}
+# Per-kind caps come from the official MiniMax video-generation V2 schema:
+#   image ≤30MB, video ≤50MB, audio ≤15MB. The previous global MAX_UPLOAD_BYTES
+#   of 50MB was too loose for images/audio (over the per-kind cap) and too tight
+#   for video (matches). Per-kind caps are applied in api_upload below.
+MAX_IMAGE_BYTES = 30 * 1024 * 1024
+MAX_AUDIO_BYTES = 15 * 1024 * 1024
+MAX_VIDEO_BYTES = 50 * 1024 * 1024
+MAX_UPLOAD_BYTES = max(MAX_IMAGE_BYTES, MAX_AUDIO_BYTES, MAX_VIDEO_BYTES)
+_ALLOWED_IMAGE_MIME = {"image/png", "image/jpeg", "image/webp",
+                       "image/heic", "image/heif"}
 _ALLOWED_VIDEO_MIME = {"video/mp4", "video/quicktime"}
 _ALLOWED_AUDIO_MIME = {"audio/mpeg", "audio/wav"}
 _ALLOWED_MIME = _ALLOWED_IMAGE_MIME | _ALLOWED_VIDEO_MIME | _ALLOWED_AUDIO_MIME
 _MIME_TO_EXT = {
     "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp",
+    "image/heic": "heic", "image/heif": "heif",
     "video/mp4": "mp4", "video/quicktime": "mov",
     "audio/mpeg": "mp3", "audio/wav": "wav",
 }
 _MIME_TO_KIND = {
     "image/png": "image", "image/jpeg": "image", "image/webp": "image",
+    "image/heic": "image", "image/heif": "image",
     "video/mp4": "video", "video/quicktime": "video",
     "audio/mpeg": "audio", "audio/wav": "audio",
+}
+_KIND_MAX_BYTES = {
+    "image": MAX_IMAGE_BYTES,
+    "video": MAX_VIDEO_BYTES,
+    "audio": MAX_AUDIO_BYTES,
 }
 _UPLOAD_CHUNK_BYTES = 1024 * 1024  # 1MB streaming chunks
 
@@ -108,11 +120,18 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     # ------------------------------------------------------------------ GET /
     @app.get("/")
     def root() -> FileResponse:
-        web_dir = Path(__file__).parent.parent.parent / "web"
+        web_dir = _web_dir()
         return FileResponse(web_dir / "index.html", media_type="text/html")
 
+    # ------------------------------------------------- static assets (web/assets)
+    from fastapi.staticfiles import StaticFiles
+
+    assets_dir = _web_dir() / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
     # ---------------------------------------------------------------- POST /api/create
-    @app.post("/api/create", deprecated=True)
+    @app.post("/api/create")
     async def api_create(body: CreateBody) -> dict[str, Any]:
         cfg = app.state.cfg  # type: Config
 
@@ -131,11 +150,16 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
 
         try:
             async with MiniMaxClient(cfg) as client:
-                task_id, _content_items = await _submit_task(client, body)
+                task_id, _content_items, used_context_ir = await _submit_task(client, body)
+
+                extra: dict[str, Any] = {}
+                if used_context_ir:
+                    extra["used_context_ir"] = True
 
                 rec = TaskRecord(
                     task_id=task_id, mode=body.mode,
                     prompt_excerpt=body.prompt[:100], status="submitted",
+                    extra=extra,
                 )
                 insert_task(rec)
 
@@ -168,164 +192,21 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
 
     # ---------------------------------------------------------------- GET /api/tasks
     @app.get("/api/tasks")
-    def api_list_tasks() -> list[dict[str, Any]]:
-        return [_record_to_dict(r) for r in list_tasks(limit=50)]
-
-    # ====================================================== v0.1.3b prepare/commit
-
-    @app.post("/api/prepare")
-    async def api_prepare(body: CreateBody) -> dict[str, Any]:
-        """Build a plan without submitting to H3. Returns a prepare_id for later commit.
-
-        Long reference videos (>15s) are automatically split into multiple
-        H3 generations via the plan_segments algorithm. The full content[]
-        draft (with each clip's CDN URL) is returned for the user to review.
-        """
+    async def api_list_tasks() -> list[dict[str, Any]]:
         cfg = app.state.cfg
-        try:
-            require_api_key(cfg)
-        except ConfigError as e:
-            raise HTTPException(status_code=503, detail=str(e))
-        _validate_mode(body)
-
-        try:
-            plan = await _build_plan(body, cfg)
-        except MediaError as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"准备失败: {e}\n\n提示: 检查参考视频路径/格式（mp4/mov/≤50MB）",
-            )
-        except ConfigError as e:
-            # H3 upload / account-level rejection — surface as 400 so the UI
-            # can show the actual reason instead of "Internal Server Error".
-            raise HTTPException(
-                status_code=400,
-                detail=f"准备失败: {e}\n\n提示: 这通常是 API key 权限不足（TokenPlan 不支持某些高级参数）。如需完整功能请使用 pay-as-you-go key。",
-            )
-
-        prepare_id = "prep-" + uuid.uuid4().hex[:12]
-        body_dict = body.model_dump()
-        now_ms = int(time.time() * 1000)
-        rec = PrepareRecord(
-            prepare_id=prepare_id,
-            payload=body_dict,
-            plan=plan,
-            status=PREPARE_STATUS_PREPARED,
-            created_at=now_ms,
-            expires_at=now_ms + PREPARE_TTL_MS,
-        )
-        insert_prepare(rec)
-
-        return {
-            "prepare_id": prepare_id,
-            "estimated_segments": max(len(plan["segments"]), 1),
-            "segments": plan["segments"],
-            "content_preview": plan["content"],
-            "warnings": plan["warnings"],
-            "expires_at": rec.expires_at,
-            "original_prompt": plan["original_prompt"],
-            "enhanced_prompt": plan["enhanced_prompt"],
-            "used_context_ir": plan["used_context_ir"],
-            "context_ir_fallback": plan["context_ir_fallback"],
-            "context_ir_error": plan.get("context_ir_error"),
-        }
-
-    @app.get("/api/prepare/{prepare_id}")
-    def api_get_prepare(prepare_id: str) -> dict[str, Any]:
-        """Return a previously-created prepare plan. 410 Gone if expired."""
-        cleanup_expired_prepares()  # lazy: mark stale rows on every lookup
-        cleanup_expired_uploads(_user_data_dir())  # v0.1.4: sweep >24h uploads
-        rec = get_prepare(prepare_id)
-        if rec is None:
-            raise HTTPException(status_code=404, detail="prepare not found")
-        now_ms = int(time.time() * 1000)
-        if rec.status == PREPARE_STATUS_COMMITTED:
-            raise HTTPException(status_code=410, detail="prepare already committed")
-        if rec.expires_at <= now_ms:
-            raise HTTPException(status_code=410, detail="prepare expired; please re-prepare")
-        return {
-            "prepare_id": rec.prepare_id,
-            "status": rec.status,
-            "expires_at": rec.expires_at,
-            "original_prompt": rec.plan.get("original_prompt"),
-            "enhanced_prompt": rec.plan.get("enhanced_prompt"),
-            "used_context_ir": rec.plan.get("used_context_ir", False),
-            "context_ir_fallback": rec.plan.get("context_ir_fallback", False),
-            "context_ir_error": rec.plan.get("context_ir_error"),
-            "segments": rec.plan.get("segments", []),
-            "content_preview": rec.plan.get("content", []),
-            "warnings": rec.plan.get("warnings", []),
-        }
-
-    @app.post("/api/commit/{prepare_id}")
-    async def api_commit(prepare_id: str) -> dict[str, Any]:
-        """Submit a prepared plan to H3. Returns task_id (parent for multi-segment).
-
-        Background: H3 calls are submitted, polled, and downloaded by
-        ``_run_multi_segment`` running as an asyncio task. The endpoint
-        returns 202-style metadata immediately so the client can move on.
-        """
-        rec = get_prepare(prepare_id)
-        if rec is None:
-            raise HTTPException(status_code=404, detail="prepare not found")
-        now_ms = int(time.time() * 1000)
-        if rec.status == PREPARE_STATUS_COMMITTED:
-            raise HTTPException(status_code=410, detail="prepare already committed")
-        if rec.expires_at <= now_ms:
-            raise HTTPException(status_code=410, detail="prepare expired; please re-prepare")
-
-        cfg = app.state.cfg
-        content = rec.plan.get("content", [])
-        segments_meta = rec.plan.get("segments", [])
-        body = rec.payload
-
-        parent_id = "task-" + uuid.uuid4().hex[:12]
-        parent_rec = TaskRecord(
-            task_id=parent_id,
-            mode="multi",
-            prompt_excerpt=(body.get("prompt") or "")[:100],
-            status="submitted",
-            extra={
-                "prepare_id": prepare_id,
-                "segments": [],   # populated as children complete
-                "total_duration_seconds": (
-                    sum(s["duration_seconds"] for s in segments_meta)
-                    if segments_meta else None
-                ),
-                "enhanced_prompt": rec.plan.get("enhanced_prompt"),
-                "used_context_ir": rec.plan.get("used_context_ir", False),
-                "context_ir_fallback": rec.plan.get("context_ir_fallback", False),
-            },
-        )
-        insert_task(parent_rec)
-        update_prepare_status(prepare_id, PREPARE_STATUS_COMMITTED, task_id=parent_id)
-
-        # Fire background coroutine; H3 calls and downloads happen there.
-        asyncio.create_task(
-            _run_multi_segment(parent_id, body, content, segments_meta, cfg)
-        )
-
-        return {
-            "task_id": parent_id,
-            "status": "submitted",
-            "segments": segments_meta,
-        }
-
-    @app.get("/api/prepares")
-    def api_list_prepares() -> list[dict[str, Any]]:
-        """List recent (non-expired) prepare records — handy for the UI."""
-        cleanup_expired_prepares()
-        cleanup_expired_uploads(_user_data_dir())  # v0.1.4: sweep >24h uploads
-        return [
-            {
-                "prepare_id": r.prepare_id,
-                "status": r.status,
-                "created_at": r.created_at,
-                "expires_at": r.expires_at,
-                "task_id": r.task_id,
-            }
-            for r in list_prepares(include_expired=False, limit=20)
-        ]
+        out: list[dict[str, Any]] = []
+        for rec in list_tasks(limit=50):
+            if rec.status not in TERMINAL_STATES:
+                # Non-terminal: best-effort refresh from API. On failure keep
+                # the local snapshot so the UI still shows *something*.
+                try:
+                    refreshed = await _refresh_task_from_api(cfg, rec)
+                except Exception:  # noqa: BLE001
+                    refreshed = _record_to_dict(rec)
+                out.append(refreshed)
+            else:
+                out.append(_record_to_dict(rec))
+        return out
 
     # ---------------------------------------------------------------- GET /api/tasks/{task_id}
     @app.get("/api/tasks/{task_id}")
@@ -335,43 +216,49 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         if rec is None:
             raise HTTPException(status_code=404, detail="task not found")
 
-        result: dict[str, Any] = _record_to_dict(rec)
-
-        # If task is pending/queued/processing, try to refresh from API
-        if rec.status not in ("submitted", "completed", "failed", "success", "Success", "Failed"):
+        # If task is non-terminal, try to refresh from API. Terminal states
+        # are read straight from the local DB — no MiniMax round-trip.
+        if rec.status not in TERMINAL_STATES:
             try:
-                require_api_key(cfg)
-                async with MiniMaxClient(cfg) as client:
-                    api_task = await client.query_video_task(task_id)
-                    status = api_task.get("status", "")
-                    update_task(task_id, status=status, last_query_at=int(time.time() * 1000))
-                    result["api_status"] = status
-                    # Attach content URL if available
-                    content = api_task.get("content")
-                    if content and isinstance(content, list) and len(content) > 0:
-                        url = content[0].get("url") if isinstance(content[0], dict) else None
-                        if url:
-                            result["content_url"] = url
+                return await _refresh_task_from_api(cfg, rec)
             except Exception:  # noqa: BLE001
-                pass  # Graceful degradation
+                return _record_to_dict(rec)
 
-        return result
+        return _record_to_dict(rec)
 
-    # -------------------------------------------------------- POST /api/tasks/{task_id}/download
-    @app.post("/api/tasks/{task_id}/download")
+    # -------------------------------------------------------- GET/POST /api/tasks/{task_id}/download
+    @app.api_route("/api/tasks/{task_id}/download", methods=["GET", "POST"])
     async def api_download_task(task_id: str) -> Response:
         cfg = app.state.cfg
         rec = get_task(task_id)
         if rec is None:
             raise HTTPException(status_code=404, detail="task not found")
 
-        video_path = Path(cfg.videos_dir) / f"{task_id}.mp4"
+        videos_dir = Path(cfg.videos_dir)
+        video_path = videos_dir / f"{task_id}.mp4"
         if not video_path.is_file():
-            raise HTTPException(
-                status_code=404,
-                detail=f"Video file not found at {video_path}. "
-                       "It may not have been downloaded yet.",
-            )
+            # On-demand download: task succeeded but the video was never
+            # fetched locally (e.g. wait=false submissions). Query the API
+            # for the result URL and pull it down. Downloading is free.
+            try:
+                require_api_key(cfg)
+                async with MiniMaxClient(cfg) as client:
+                    api_task = await client.query_video_task(task_id)
+                    if api_task.get("status") not in ("Success", "Succeeded", "succeeded"):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"任务状态 {api_task.get('status')}，视频尚未生成完成，请稍后再试",
+                        )
+                    ok = await download_task_result(client, api_task, video_path)
+                if not ok:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="任务已完成但响应中没有视频 URL，无法下载",
+                    )
+            except HTTPException:
+                raise
+            except MiniPicError as e:
+                raise HTTPException(status_code=400, detail=f"下载失败: {e}")
 
         return FileResponse(
             video_path,
@@ -386,19 +273,43 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         """Return masked API key + source, plus model metadata for the UI.
 
         Never returns the raw key.
+
+        v0.2.0+: ``has_key`` / ``masked`` / ``source`` only reflect the
+        **user config file** (the single source of truth). On a fresh launch
+        with no user config — even if ``MINIMAX_API_KEY`` is set in the
+        environment or the CLI's local config has a key — the UI reports
+        ``has_key=False, source="none"``. This is intentional: the Web UI is
+        the user-facing surface and only knows about keys the user saved
+        through it; env / local keys belong to the CLI developer workflow.
+        Once the user saves a key via POST /api/config, the next GET here
+        reports ``has_key=True, source="user"`` and stays that way across
+        process restarts.
         """
-        cfg = app.state.cfg
+        # Read the user config file directly — do NOT trust app.state.cfg
+        # because at startup it may already carry an env/local key in memory
+        # (which the UI should not surface).
+        user_path = _user_config_path()
+        user_key: Optional[str] = None
+        if user_path.is_file():
+            try:
+                data = json.loads(user_path.read_text(encoding="utf-8"))
+                user_key = (data.get("api_key") or "").strip() or None
+            except (OSError, ValueError):
+                user_key = None
+
         return {
-            "has_key": cfg.is_valid(),
-            "masked": mask_key(cfg.api_key),
-            "source": _detect_key_source(cfg),
-            "user_config_path": str(_user_config_path()),
+            "has_key": bool(user_key),
+            "masked": mask_key(user_key),
+            "source": "user" if user_key else "none",
+            "user_config_path": str(user_path),
             "models": [
                 {
                     "name": name,
                     "resolutions": MODEL_CONSTRAINTS[name]["resolutions"],
                     "duration_min": MODEL_CONSTRAINTS[name]["duration_min"],
                     "duration_max": MODEL_CONSTRAINTS[name]["duration_max"],
+                    "modes": MODEL_CONSTRAINTS[name]["modes"],
+                    "i2v_roles": MODEL_CONSTRAINTS[name]["i2v_roles"],
                 }
                 for name in API_MODELS
             ],
@@ -408,12 +319,15 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
     # -------------------------------------------------------- POST /api/config
     @app.post("/api/config")
     def api_set_config(payload: Annotated[ConfigBody, Body()]) -> dict[str, Any]:
-        """Persist a new API key to the user config dir and reload cfg.
+        """Persist a new API key to the user config dir and update cfg in place.
 
-        Replaces ``app.state.cfg.api_key`` directly (no env override) so the
-        next /api/create can use it. If the env var ``MINIMAX_API_KEY`` is
-        also set, that value will shadow this one on the next full reload —
-        the UI surfaces that fact via the ``source`` field of /api/config.
+        The user config file is the **single source of truth for the API key**
+        (v0.2.0+). This handler writes it there and updates the in-memory
+        cfg so the next /api/create uses the new key. The same file is read
+        by ``load_config()`` (CLI + subsequent app restarts), so a key saved
+        here is immediately visible to the CLI without any restart — because
+        user > local > env precedence, the saved key wins even when the env
+        var is set (env is only a fallback for files without a key).
         """
         cfg = app.state.cfg
         new_key = payload.api_key.strip()
@@ -431,7 +345,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             "ok": True,
             "masked": mask_key(cfg.api_key),
             "saved_to": str(saved_to),
-            "source": _detect_key_source(cfg),
+            "source": "user",
         }
 
     # -------------------------------------------------------- GET /api/probe/video (v0.1.5)
@@ -510,6 +424,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             )
         ext = _MIME_TO_EXT[ct]
         kind = _MIME_TO_KIND[ct]
+        kind_cap = _KIND_MAX_BYTES[kind]
 
         uploads_dir = user_data_path("uploads")
         uploads_dir.mkdir(parents=True, exist_ok=True)
@@ -525,9 +440,9 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                     if not chunk:
                         break
                     written += len(chunk)
-                    if written > MAX_UPLOAD_BYTES:
-                        # Over cap — abort. Close first so we can unlink on
-                        # Windows without "file in use" errors.
+                    if written > kind_cap:
+                        # Over per-kind cap — abort. Close first so we can
+                        # unlink on Windows without "file in use" errors.
                         out.close()
                         try:
                             target.unlink(missing_ok=True)
@@ -536,8 +451,9 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                         raise HTTPException(
                             status_code=400,
                             detail=(
-                                f"file too large: >{MAX_UPLOAD_BYTES} bytes "
-                                f"(50MB)"
+                                f"{kind} file too large: >{kind_cap} bytes "
+                                f"(per-kind cap; image ≤30MB, audio ≤15MB, "
+                                f"video ≤50MB)"
                             ),
                         )
                     hasher.update(chunk)
@@ -576,7 +492,7 @@ class CreateBody(BaseModel):
     ref_videos: list[dict[str, Any]] = Field(default_factory=list)
     ref_audios: list[dict[str, Any]] = Field(default_factory=list)
     wait: bool = False
-    use_context_ir: bool = True  # v0.1.3b: default ON, graceful fallback on failure
+    use_context_ir: bool = True
 
 
 class ConfigBody(BaseModel):
@@ -584,8 +500,59 @@ class ConfigBody(BaseModel):
 
 
 def _validate_mode(body: CreateBody) -> None:
+    """校验 CreateBody 对齐 MiniMax V2 API schema。
+
+    对齐要点（v0.1.6+）：
+      - i2v 支持首帧/尾帧两张图组合（role 各一），也支持单图；
+      - i2v 与 r2v 互斥（reference_* 角色不得与 first/last_frame 混用）；
+      - text ≤7000 字符、ref_images ≤9、first_frame ≤1、last_frame ≤1；
+      - 角色是否被模型支持由 validate_model_modes 校验（H3/H3-Max
+        已统一收紧为首/尾帧，middle_frame 一律拒绝）。
+    """
     mode = body.mode
     ratio = body.ratio
+
+    # ---------------- 全局上限（先做，与模式无关） ----------------
+    if len(body.prompt) > 7000:
+        raise HTTPException(
+            status_code=400,
+            detail="提示词超过 7000 字符上限",
+        )
+    if len(body.ref_images) > 9:
+        raise HTTPException(
+            status_code=400,
+            detail="参考图最多 9 张",
+        )
+    first_count = sum(
+        1 for r in body.ref_images if r.get("role") == "first_frame"
+    )
+    last_count = sum(
+        1 for r in body.ref_images if r.get("role") == "last_frame"
+    )
+    if first_count > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="first_frame 最多 1 张",
+        )
+    if last_count > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="last_frame 最多 1 张",
+        )
+
+    # ---------------- 全局互斥校验（i2v 与 r2v 角色不可混用） ----------------
+    has_first_or_last = first_count + last_count > 0
+    has_reference = any(
+        r.get("role") in {"reference_image", "reference_video", "reference_audio"}
+        for r in body.ref_images
+    )
+    # ref_videos / ref_audios 在 r2v 分支里也会校验角色；
+    # 这里只看 ref_images 一项就足够覆盖"图生视频与多模态参考互斥"。
+    if has_first_or_last and has_reference:
+        raise HTTPException(
+            status_code=400,
+            detail="图生视频（first_frame/last_frame）与多模态参考（reference_*）互斥，不可混用",
+        )
 
     if mode == "t2v":
         if not ratio or ratio == "adaptive":
@@ -605,17 +572,38 @@ def _validate_mode(body: CreateBody) -> None:
                 status_code=400,
                 detail="i2v mode forces ratio=adaptive; do not supply a ratio",
             )
-        if len(body.ref_images) != 1:
+        n_imgs = len(body.ref_images)
+        if n_imgs not in (1, 2):
             raise HTTPException(
                 status_code=400,
-                detail="i2v mode requires exactly one reference image",
+                detail="i2v mode requires 1 or 2 reference images "
+                       "(first_frame optional last_frame)",
             )
-        first_ref = body.ref_images[0]
-        if first_ref.get("role") != "first_frame":
-            raise HTTPException(
-                status_code=400,
-                detail='i2v reference image must have role="first_frame"',
+        # 单图：role ∈ {first_frame, last_frame}（默认 first_frame）；
+        # 双图：必须恰好一张 first_frame + 一张 last_frame，且无重复。
+        if n_imgs == 1:
+            i2v_role = body.ref_images[0].get("role") or "first_frame"
+            try:
+                validate_model_modes(body.model, mode="i2v", i2v_role=i2v_role)
+            except ConfigError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+        else:  # n_imgs == 2
+            roles = sorted(
+                (r.get("role") or "") for r in body.ref_images
             )
+            if roles != ["first_frame", "last_frame"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="i2v 双图必须一张 role=first_frame + 一张 role=last_frame",
+                )
+            # 角色都已合法，逐个校验模型支持（H3 与 H3-Max 均通过）。
+            for r in body.ref_images:
+                try:
+                    validate_model_modes(
+                        body.model, mode="i2v", i2v_role=r.get("role")
+                    )
+                except ConfigError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
         if body.ref_videos:
             raise HTTPException(
                 status_code=400,
@@ -629,6 +617,35 @@ def _validate_mode(body: CreateBody) -> None:
                 status_code=400,
                 detail="r2v mode requires at least one reference (image, video, or audio)",
             )
+        # 多模态参考能力由模型决定：H3 支持，H3-Max 不支持。
+        try:
+            validate_model_modes(body.model, mode="r2v")
+        except ConfigError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        # r2v 的图角色只能是 reference_image；first/last_frame 已在全局互斥里拦掉。
+        for r in body.ref_images:
+            role = r.get("role") or "reference_image"
+            if role != "reference_image":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"r2v mode only allows role=reference_image for images; got {role!r}",
+                )
+        # 视频/音频的角色默认即 reference_video / reference_audio，
+        # 缺省时放行；显式给了其它角色也放行（兼容性最好，且服务端会再校验）。
+        for r in body.ref_videos:
+            role = r.get("role")
+            if role is not None and role != "reference_video":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"r2v mode only allows role=reference_video for videos; got {role!r}",
+                )
+        for r in body.ref_audios:
+            role = r.get("role")
+            if role is not None and role != "reference_audio":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"r2v mode only allows role=reference_audio for audios; got {role!r}",
+                )
 
     # Model-specific parameter validation (resolution, duration). Raises
     # HTTPException(400) with a user-friendly message.
@@ -640,43 +657,88 @@ def _validate_mode(body: CreateBody) -> None:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-async def _submit_task(client: MiniMaxClient, body: CreateBody) -> tuple[str, list[dict[str, Any]]]:
-    """Build content[] and submit. Returns (task_id, content_items)."""
-    content: list[dict[str, Any]] = []
+async def _refresh_task_from_api(cfg: Config, rec: TaskRecord) -> dict[str, Any]:
+    """Query the MiniMax API for ``rec.task_id``, persist updates, return the
+    serialized dict enriched with ``api_status`` / ``usage`` / ``content_url``.
 
-    # Text item
-    content.append({"type": "text", "text": body.prompt})
+    Raises whatever the client raises — callers are expected to fall back to
+    ``_record_to_dict(rec)`` on failure (graceful degradation: the UI still
+    shows *something*).
+    """
+    result: dict[str, Any] = _record_to_dict(rec)
+    require_api_key(cfg)
+    async with MiniMaxClient(cfg) as client:
+        api_task = await client.query_video_task(rec.task_id)
+    status = api_task.get("status", "")
+    update_task(
+        rec.task_id, status=status, last_query_at=int(time.time() * 1000)
+    )
+    result["api_status"] = status
+    # Persist usage (total_seconds etc.) so the UI can show cost.
+    usage = api_task.get("usage")
+    if usage:
+        extra = dict(rec.extra or {})
+        extra["usage"] = usage
+        update_task(rec.task_id, extra=extra)
+        result["usage"] = usage
+    # Attach content URL if available (content may be a dict {"url": ...}
+    # or a list — handled by media._extract_video_url).
+    url = _extract_video_url(api_task)
+    if url:
+        result["content_url"] = url
+    # Reflect the new status in the serialized record.
+    result["status"] = status
+    return result
 
-    # Reference images
-    for ref in body.ref_images:
-        path = ref.get("path") or ""
-        role = ref.get("role") or "reference_image"
-        if path.startswith("http://") or path.startswith("https://"):
-            url = path
-        else:
-            url = await resolve_reference(client, path)
-        content.append({"type": "image_url", "url": url, "role": role})
 
-    # Reference videos — may need splitting
-    for ref in body.ref_videos:
-        path = ref.get("path") or ""
-        clips_spec: Optional[str] = ref.get("clips")
-        clips = await prepare_reference_video(Path(path), clips_spec=clips_spec)
-        for clip in clips:
-            if path.startswith("http://") or path.startswith("https://"):
-                clip_url = path
-            else:
-                clip_url = await resolve_reference(client, clip.path)
-            content.append({"type": "video_url", "url": clip_url, "duration": clip.duration_seconds})
+async def _submit_task(client: MiniMaxClient, body: CreateBody) -> tuple[str, list[dict[str, Any]], bool]:
+    """Build content[] and submit. Returns ``(task_id, content_items, used_context_ir)``.
 
-    # Reference audios
-    for ref in body.ref_audios:
-        path = ref.get("path") or ""
-        if path.startswith("http://") or path.startswith("https://"):
-            url = path
-        else:
-            url = await resolve_reference(client, path)
-        content.append({"type": "audio_url", "url": url})
+    v0.1.5+: reference videos must be ≤15s (H3 per-call cap). prepare_reference_video
+    raises MediaError on longer sources — surfaced as a 400 to the caller.
+
+    The content[] shape (text flat, role-on-every-item, duration on video/audio
+    clips) is owned by :func:`minipic.media.build_content` — keep this helper
+    thin so CLI and Web cannot drift apart again.
+
+    Context-IR (optional, default ON):
+      H3 supports ``/v2/h3_context_ir`` which rewrites a brief into the
+      6-section H3 prompt structure. We submit the original content (with
+      uploaded references — already paid for) to Context-IR, swap the
+      ``text`` element with the rewritten prompt, then submit the actual
+      video generation task. ``H3-Max`` is unsupported and silently falls
+      back to the original prompt (no error). Any failure (TimeoutError,
+      ConfigError, network) also falls back silently — Context-IR is a
+      nice-to-have, not a gate.
+    """
+    content = await build_content(
+        prompt=body.prompt,
+        client=client,
+        ref_images=body.ref_images,
+        ref_videos=body.ref_videos,
+        ref_audios=body.ref_audios,
+    )
+
+    used_context_ir = False
+    if body.use_context_ir and body.model == "MiniMax-H3":
+        # i2v forces ratio=adaptive; the same applies to Context-IR, which
+        # is just another H3 video path with no resolution requirement.
+        ir_ratio = "adaptive" if body.mode == "i2v" else (body.ratio or "adaptive")
+        try:
+            ir_task_id = await client.create_context_ir_task(
+                model=body.model,
+                content=content,
+                duration=body.duration,
+                ratio=ir_ratio,
+            )
+            enhanced = await client.fetch_context_ir_prompt(ir_task_id)
+            if enhanced and content and content[0].get("type") == "text":
+                content[0]["text"] = enhanced
+                used_context_ir = True
+                log.info("context-ir rewrote prompt for %s", id(content))
+        except Exception as e:  # noqa: BLE001 — graceful fallback
+            log.warning("context-ir failed (%s), falling back to original prompt",
+                        e.__class__.__name__)
 
     # Determine ratio
     if body.mode == "i2v":
@@ -691,7 +753,7 @@ async def _submit_task(client: MiniMaxClient, body: CreateBody) -> tuple[str, li
         resolution=body.resolution,
         ratio=ratio,
     )
-    return task_id, content
+    return task_id, content, used_context_ir
 
 
 async def _download_result(
@@ -700,360 +762,22 @@ async def _download_result(
     task_id: str,
     final_task: dict[str, Any],
 ) -> None:
-    """Download the result MP4 to cfg.videos_dir / {task_id}.mp4."""
-    content = final_task.get("content") or []
-    if not content:
-        return
-    first = content[0]
-    url: Optional[str] = None
-    if isinstance(first, dict):
-        url = first.get("url")
-    if not url:
-        return
+    """Download the result MP4 to cfg.videos_dir / {task_id}.mp4.
 
+    Silent no-op when the task response carries no URL — that mirrors the
+    legacy behaviour (the file simply isn't downloaded yet). The actual
+    extraction + atomic download logic lives in
+    :func:`minipic.media.download_task_result`.
+    """
     videos_dir = Path(cfg.videos_dir)
     videos_dir.mkdir(parents=True, exist_ok=True)
     dest = videos_dir / f"{task_id}.mp4"
-    tmp = videos_dir / f"{task_id}.mp4.tmp"
-
-    await client.download_video(url, tmp)
-    tmp.replace(dest)
-
-
-# ====================================================== v0.1.3b prepare / commit helpers
-
-async def _maybe_enhance_prompt(
-    body: CreateBody,
-    content: list[dict[str, Any]],
-    client: MiniMaxClient,
-    warnings: list[str],
-) -> tuple[str, bool, bool, Optional[str]]:
-    """Rewrite the user's prompt through H3-Context-IR. Falls back gracefully.
-
-    Returns
-    -------
-    (final_prompt, used_context_ir, fallback_occurred, error_msg)
-        * final_prompt         — what we'll actually send to H3 (Context-IR output or original)
-        * used_context_ir      — True iff Context-IR succeeded and we used its rewrite
-        * fallback_occurred    — True iff we tried Context-IR and fell back to the original
-        * error_msg            — short failure reason when fallback_occurred, else None
-    """
-    if not getattr(body, "use_context_ir", True):
-        return body.prompt, False, False, None
-    try:
-        # Re-use the existing content[] for the IR request. The first element
-        # is always the text prompt; later elements are reference media.
-        ir_content = [{"type": "text", "text": body.prompt}] + list(content[1:])
-        ir_task_id = await client.create_context_ir_task(
-            model=body.model if body.model == "MiniMax-H3" else "MiniMax-H3",
-            content=ir_content,
-            duration=body.duration,
-            ratio=body.ratio or "adaptive",
-        )
-        enhanced = await client.fetch_context_ir_prompt(ir_task_id, max_wait_seconds=180.0)
-        log.info("Context-IR: rewrote prompt for %s", body.mode)
-        return enhanced, True, False, None
-    except (MiniPicError, asyncio.TimeoutError, OSError) as e:
-        msg = (
-            f"Context-IR 改写失败 ({e.__class__.__name__}: {e})，"
-            f"已 fallback 用原 prompt。\n"
-            f"提示: Context-IR 通常需要 pay-as-you-go 类型的 API key，"
-            f"TokenPlan 不支持 Context-IR。"
-        )
-        log.warning("Context-IR fallback: %s", msg)
-        warnings.append(msg)
-        return body.prompt, False, True, str(e)
-
-
-async def _build_plan(body: CreateBody, cfg: Config) -> dict[str, Any]:
-    """Build a complete H3 plan without submitting. Returns the plan dict.
-
-    Multi-segment handling
-    ----------------------
-    Reference videos longer than ``REF_VIDEO_MAX_DURATION`` (15s) are split
-    into N segments via ``plan_segments`` and physically cut into per-segment
-    mp4 files via ``extract_reference_clips``. Each clip is uploaded to the
-    CDN; the resulting ``content[]`` contains N ``video_url`` entries (one
-    per segment). ``segments`` is the per-segment metadata for the UI.
-
-    Context-IR
-    ----------
-    The user's natural-language prompt is sent through H3-Context-IR first
-    (default ON). If Context-IR fails (TokenPlan 2013, network, etc.) the
-    original prompt is used and a warning is added to the plan.
-    """
-    warnings: list[str] = []
-    segments_meta: list[dict[str, Any]] = []
-    content: list[dict[str, Any]] = []
-
-    async with MiniMaxClient(cfg) as client:
-        # 1) Resolve references first so we know what the content array looks like
-        # Text placeholder — replaced by enhanced (or original) prompt below
-        content.append({"type": "text", "text": body.prompt})
-
-        for ref in body.ref_images:
-            path = ref.get("path") or ""
-            role = ref.get("role") or "reference_image"
-            if path.startswith("http://") or path.startswith("https://"):
-                url = path
-            else:
-                url = await resolve_reference(client, path)
-            content.append({"type": "image_url", "url": url, "role": role})
-
-        for ref in body.ref_videos:
-            path = ref.get("path") or ""
-            if not path:
-                warnings.append("skipping empty ref_videos entry")
-                continue
-            if path.startswith("http://") or path.startswith("https://"):
-                # Remote URL — cannot split, just append
-                content.append({"type": "video_url", "url": path})
-                continue
-            local_path = Path(path)
-            if not local_path.is_file():
-                raise MediaError(f"reference video not found: {path}")
-            duration = ffprobe_duration(local_path)
-            if duration <= REF_VIDEO_MAX_DURATION + 0.05:
-                # Short: use the original file as-is
-                url = await resolve_reference(client, local_path)
-                content.append({"type": "video_url", "url": url, "duration": int(duration)})
-            else:
-                # Long: split into N segments and upload each
-                boundaries = find_shot_boundaries(local_path)
-                segments = plan_segments(duration, boundaries)
-                clip_paths = await extract_reference_clips(local_path, segments)
-                for i, clip_path in enumerate(clip_paths):
-                    url = await resolve_reference(client, clip_path)
-                    content.append({
-                        "type": "video_url",
-                        "url": url,
-                        "duration": segments[i].duration_seconds,
-                    })
-                    segments_meta.append({
-                        "index": i,
-                        "start_seconds": segments[i].start_seconds,
-                        "duration_seconds": segments[i].duration_seconds,
-                        "ref_clip_path": str(clip_path),
-                    })
-                total = sum(s.duration_seconds for s in segments)
-                if abs(total - duration) > 1.0:
-                    warnings.append(
-                        f"总输出 {total}s 比参考 {duration:.1f}s "
-                        f"{'长' if total > duration else '短'} {abs(total - duration):.2f}s"
-                    )
-
-        for ref in body.ref_audios:
-            path = ref.get("path") or ""
-            if not path:
-                continue
-            if path.startswith("http://") or path.startswith("https://"):
-                url = path
-            else:
-                url = await resolve_reference(client, path)
-            content.append({"type": "audio_url", "url": url})
-
-        # 2) Context-IR — rewrite the prompt (or fall back). Must run AFTER
-        #    reference resolution so the IR request can include the same media.
-        final_prompt, used_ir, fallback, ir_error = await _maybe_enhance_prompt(
-            body, content, client, warnings
-        )
-        content[0]["text"] = final_prompt
-
-    return {
-        "content": content,
-        "segments": segments_meta,
-        "warnings": warnings,
-        "original_prompt": body.prompt,
-        "enhanced_prompt": final_prompt,
-        "used_context_ir": used_ir,
-        "context_ir_fallback": fallback,
-        "context_ir_error": ir_error,
-    }
-
-
-async def _run_multi_segment(
-    parent_id: str,
-    body: dict[str, Any],
-    content: list[dict[str, Any]],
-    segments_meta: list[dict[str, Any]],
-    cfg: Config,
-) -> None:
-    """Background: submit N H3 children, poll, download, concat into final video.
-
-    Each child is recorded in ``tasks`` with mode=r2v and
-    ``extra.parent_task_id = parent_id``. The parent task is updated in-place
-    with the list of child results under ``extra.segments``.
-
-    Status mapping for the parent
-    -----------------------------
-    * All children succeed          → ``succeeded``
-    * Some succeed, some fail       → ``partial`` (still concat the good ones)
-    * All children fail             → ``failed``
-    * Any uncaught exception        → ``failed`` with error=traceback excerpt
-    """
-    parent_extra = {
-        "prepare_id": parent_id,  # placeholder; replaced below from TaskRecord
-        "segments": [],
-        "total_duration_seconds": None,
-    }
-    # Pull any extra fields the API endpoint already stored so we don't lose them
-    existing = get_task(parent_id)
-    if existing is not None and existing.extra:
-        parent_extra.update(existing.extra)
-    try:
-        async with MiniMaxClient(cfg) as client:
-            child_outputs: list[Optional[Path]] = []
-            child_results: list[dict[str, Any]] = []
-            child_iter: list[Optional[dict[str, Any]]] = (
-                segments_meta if segments_meta else [None]
-            )
-            videos_dir = Path(cfg.videos_dir)
-            videos_dir.mkdir(parents=True, exist_ok=True)
-
-            for i, seg in enumerate(child_iter):
-                child_id = "task-" + uuid.uuid4().hex[:12]
-                seg_index = seg["index"] if seg is not None else 0
-                seg_duration = seg["duration_seconds"] if seg is not None else body["duration"]
-                seg_output = videos_dir / f"{parent_id}_seg{i:02d}.mp4"
-
-                # Insert the child row up-front so the UI can show progress
-                child_rec = TaskRecord(
-                    task_id=child_id,
-                    mode=body.get("mode", "r2v"),
-                    prompt_excerpt=(body.get("prompt") or "")[:100],
-                    status="submitted",
-                    extra={
-                        "parent_task_id": parent_id,
-                        "segment_index": seg_index,
-                    },
-                )
-                insert_task(child_rec)
-
-                try:
-                    h3_task_id = await client.create_video_task(
-                        model=body.get("model", "MiniMax-H3"),
-                        content=content,
-                        duration=int(seg_duration),
-                        resolution=body.get("resolution", "768P"),
-                        ratio=(
-                            "adaptive" if body.get("mode") == "i2v"
-                            else (body.get("ratio") or "adaptive")
-                        ),
-                    )
-                    update_task(
-                        child_id,
-                        status="submitted",
-                        output_path=str(seg_output),
-                    )
-                    log.info("multi[%s] child %d (%ds) submitted as %s",
-                             parent_id, seg_index, seg_duration, h3_task_id)
-                    final = await poll_until_done(
-                        client, h3_task_id, max_wait_seconds=30 * 60,
-                    )
-                    api_status = final.get("status", "Success")
-                    # Download the result
-                    final_content = final.get("content") or []
-                    video_url: Optional[str] = None
-                    for entry in final_content:
-                        if isinstance(entry, dict):
-                            video_url = (
-                                entry.get("video_url", {}).get("url")
-                                or entry.get("url")
-                            )
-                            if video_url:
-                                break
-                    if api_status == "Success" and video_url:
-                        await client.download_video(video_url, seg_output)
-                        update_task(child_id, status="Success",
-                                    output_path=str(seg_output))
-                        child_outputs.append(seg_output)
-                    else:
-                        update_task(child_id, status="Failed", error=f"H3 status: {api_status}")
-                        child_outputs.append(None)
-                    child_results.append({
-                        "task_id": child_id,
-                        "index": seg_index,
-                        "duration_seconds": seg_duration,
-                        "status": api_status,
-                        "h3_task_id": h3_task_id,
-                        "output_path": str(seg_output) if seg_output.is_file() else None,
-                    })
-                except (TaskError, MiniPicError) as e:
-                    log.warning("multi[%s] child %d failed: %s", parent_id, seg_index, e)
-                    update_task(child_id, status="Failed", error=str(e))
-                    child_outputs.append(None)
-                    child_results.append({
-                        "task_id": child_id,
-                        "index": seg_index,
-                        "duration_seconds": seg_duration,
-                        "status": "Failed",
-                        "error": str(e),
-                    })
-                # Update the parent after each child so the UI can show progress
-                parent_extra["segments"] = child_results
-                parent_extra["total_duration_seconds"] = (
-                    sum(c["duration_seconds"] for c in child_results)
-                )
-                update_task(
-                    parent_id,
-                    status="processing",
-                    last_query_at=int(time.time() * 1000),
-                )
-                # Write the parent extra into storage via update_task (no helper for extra)
-                # Use a direct sqlite UPDATE through the storage module
-                _update_task_extra(parent_id, parent_extra)
-
-            # Concat the successful children
-            good = [p for p in child_outputs if p is not None]
-            final_path = videos_dir / f"{parent_id}.mp4"
-            if not good:
-                update_task(parent_id, status="failed", error="all segments failed")
-                _update_task_extra(parent_id, parent_extra)
-                return
-            if len(good) == 1:
-                # Single success — promote to the final file name
-                good[0].replace(final_path)
-            else:
-                _media_module.concat_videos(good, final_path)
-                # Clean up intermediate _segNN files (success path only)
-                for p in good:
-                    if p.exists() and p != final_path:
-                        p.unlink(missing_ok=True)
-
-            success_count = sum(1 for c in child_results if c.get("status") == "Success")
-            if success_count == len(child_results):
-                status = "succeeded"
-            elif success_count > 0:
-                status = "partial"
-            else:
-                status = "failed"
-            update_task(
-                parent_id, status=status,
-                output_path=str(final_path),
-                last_query_at=int(time.time() * 1000),
-            )
-            _update_task_extra(parent_id, parent_extra)
-    except Exception as e:  # noqa: BLE001
-        log.exception("multi-segment parent %s failed unexpectedly", parent_id)
-        update_task(parent_id, status="failed", error=f"unexpected: {e}")
-        _update_task_extra(parent_id, parent_extra)
-
-
-def _update_task_extra(task_id: str, extra: dict[str, Any]) -> None:
-    """Direct UPDATE on tasks.extra for fields the public update_task doesn't expose."""
-    import sqlite3
-    from .storage import db_path
-    with sqlite3.connect(str(db_path()), timeout=10.0) as c:
-        c.execute(
-            "UPDATE tasks SET extra = ? WHERE task_id = ?",
-            (json.dumps(extra, ensure_ascii=False), task_id),
-        )
-        c.commit()
+    await download_task_result(client, final_task, dest)
 
 
 def _record_to_dict(rec: TaskRecord) -> dict[str, Any]:
-    """Serialize a TaskRecord for the API, expanding multi-segment children."""
-    out: dict[str, Any] = {
+    """Serialize a TaskRecord for the API."""
+    return {
         "task_id": rec.task_id,
         "mode": rec.mode,
         "prompt_excerpt": rec.prompt_excerpt,
@@ -1063,45 +787,44 @@ def _record_to_dict(rec: TaskRecord) -> dict[str, Any]:
         "error": rec.error,
         "extra": rec.extra,
     }
-    # Expand child metadata for multi-segment parents
-    if rec.mode == "multi" and rec.extra.get("segments"):
-        children: list[dict[str, Any]] = []
-        for seg in rec.extra["segments"]:
-            child = get_task(seg["task_id"])
-            if child is not None:
-                children.append(_record_to_dict(child))
-        out["children"] = children
-    return out
 
 
 def _detect_key_source(cfg: Config) -> str:
-    """Best-effort: report which config layer the live key came from.
+    """Best-effort: report which config layer the live key actually came from.
 
-    Priority matches ``load_config()``: env > local config.json > user config
-    dir. Returns "none" when no key is configured anywhere.
+    Priority (v0.2.0+) matches ``load_config()``: user config dir wins over
+    local cwd config.json, which wins over the env var. Resolution order is
+    user → local → env → none, where "env" only appears when no file source
+    has a non-empty api_key. Returns "none" when no key is configured
+    anywhere.
+
+    Note: the Web UI's ``GET /api/config`` does NOT use this function — it
+    reads the user config file directly so the UI surfaces only the keys
+    the user has saved through it. This helper remains for callers that
+    want a single-string label for the *live* key (used by direct CLI /
+    programmatic inspection and by tests).
     """
+    # 1. user config dir wins (UI-saved key persists across restarts).
+    user_path = _user_config_path()
+    if user_path.is_file():
+        try:
+            data = json.loads(user_path.read_text(encoding="utf-8"))
+            if (data.get("api_key") or "").strip():
+                return "user"
+        except (OSError, ValueError):
+            pass
+    # 2. local cwd config.json beats env.
+    local_path = Path.cwd() / "config.json"
+    if local_path.is_file():
+        try:
+            data = json.loads(local_path.read_text(encoding="utf-8"))
+            if (data.get("api_key") or "").strip():
+                return "local"
+        except (OSError, ValueError):
+            pass
+    # 3. env var — only acts as a fallback when no file has a key.
     if os.environ.get("MINIMAX_API_KEY", "").strip():
         return "env"
-    if cfg.api_key:
-        # Both local and user dir could host the key; we report whichever the
-        # file system currently has. The order mirrors load_config (local
-        # wins over user), so check local first.
-        local_path = Path.cwd() / "config.json"
-        if local_path.is_file():
-            try:
-                data = json.loads(local_path.read_text(encoding="utf-8"))
-                if (data.get("api_key") or "").strip():
-                    return "local"
-            except (OSError, ValueError):
-                pass
-        user_path = _user_config_path()
-        if user_path.is_file():
-            try:
-                data = json.loads(user_path.read_text(encoding="utf-8"))
-                if (data.get("api_key") or "").strip():
-                    return "user"
-            except (OSError, ValueError):
-                pass
     return "none"
 
 
@@ -1119,4 +842,5 @@ app: FastAPI = create_app()
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("minipic.web:app", host="127.0.0.1", port=8765, reload=False)
+    # Fixed port, same as the CLI `web` command (minipic.cli.WEB_PORT).
+    uvicorn.run("minipic.web:app", host="127.0.0.1", port=7860, reload=False)
