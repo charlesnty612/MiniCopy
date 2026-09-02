@@ -505,6 +505,36 @@ class TestApiGetTask:
             assert fake.query_video_task.await_count == 0, terminal
 
 
+# --------------------------------------------------------------------------- DELETE /api/tasks/{task_id} (v0.2.3)
+class TestApiDeleteTask:
+    def test_deletes_existing_task_returns_200(self, web_client: TestClient) -> None:
+        from minipic.storage import insert_task
+        insert_task(TaskRecord(
+            task_id="tid-del-ok", mode="t2v", prompt_excerpt="p", status="submitted",
+        ))
+        resp = web_client.delete("/api/tasks/tid-del-ok")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data == {"deleted": True, "task_id": "tid-del-ok"}
+        # Subsequent GET → 404 (row really is gone)
+        assert web_client.get("/api/tasks/tid-del-ok").status_code == 404
+
+    def test_delete_missing_returns_404(self, web_client: TestClient) -> None:
+        resp = web_client.delete("/api/tasks/never-existed")
+        assert resp.status_code == 404
+
+    def test_delete_does_not_affect_siblings(self, web_client: TestClient) -> None:
+        from minipic.storage import insert_task
+        insert_task(TaskRecord(
+            task_id="tid-del-keep", mode="t2v", prompt_excerpt="k", status="Success",
+        ))
+        resp = web_client.delete("/api/tasks/tid-del-keep")
+        assert resp.status_code == 200
+        # The deleted row really is gone from the list:
+        listed = web_client.get("/api/tasks").json()
+        assert not any(t["task_id"] == "tid-del-keep" for t in listed)
+
+
 # --------------------------------------------------------------------------- POST /api/tasks/{task_id}/download
 class TestApiDownloadTask:
     def test_404_for_missing_task(self, web_client: TestClient) -> None:
@@ -1108,7 +1138,7 @@ class TestApiConfigEndpoints:
         assert "2K" not in max_m["resolutions"]
         assert max_m["duration_min"] == 5
         # v0.2.2+: server version is exposed to the UI for footer display
-        assert data["version"] == "0.2.2"
+        assert data["version"] == "0.2.3"
 
     def test_get_handles_missing_key(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

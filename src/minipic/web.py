@@ -42,6 +42,7 @@ from .media import (
 from .poller import TERMINAL_STATES, poll_until_done
 from .storage import (
     TaskRecord,
+    delete_task,
     get_task,
     insert_task,
     list_tasks,
@@ -226,6 +227,27 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                 return _record_to_dict(rec)
 
         return _record_to_dict(rec)
+
+    # ---------------------------------------------------------------- DELETE /api/tasks/{task_id} (v0.2.3)
+    @app.delete("/api/tasks/{task_id}")
+    def api_delete_task(task_id: str) -> dict[str, Any]:
+        """Remove the local SQLite record for ``task_id``.
+
+        **Only deletes the local ledger row.** The MiniMax-side task itself is
+        **not** cancelled — the V2 video-generation API exposes no cancel
+        endpoint, so a submitted task continues to run (and consume balance)
+        until it reaches a terminal state on its own. Any MP4 already
+        downloaded to ``cfg.videos_dir`` is also intentionally left on disk:
+        deleting it would silently orphan the user's video. Callers wanting
+        to scrub the file too should do it from the host process after a 200
+        here.
+
+        Returns ``{"deleted": True, "task_id": <id>}`` on success, or 404 when
+        no such row exists.
+        """
+        if not delete_task(task_id):
+            raise HTTPException(status_code=404, detail="task not found")
+        return {"deleted": True, "task_id": task_id}
 
     # -------------------------------------------------------- GET/POST /api/tasks/{task_id}/download
     @app.api_route("/api/tasks/{task_id}/download", methods=["GET", "POST"])

@@ -15,6 +15,7 @@ from minipic.storage import (
     UPLOAD_TTL_MS,
     cleanup_expired_uploads,
     db_path,
+    delete_task,
     get_task,
     init_db,
     insert_task,
@@ -236,6 +237,31 @@ class TestGetTask:
     def test_returns_none_for_missing(self, storage_db: Path) -> None:
         init_db()
         assert get_task("nonexistent") is None
+
+
+# ============================================================ v0.2.3 delete_task
+class TestDeleteTask:
+    def test_deletes_existing_record_returns_true(self, storage_db: Path) -> None:
+        init_db()
+        r = TaskRecord(task_id="tid-del-1", mode="t2v", prompt_excerpt="p")
+        insert_task(r)
+        assert get_task("tid-del-1") is not None
+        assert delete_task("tid-del-1") is True
+        # Subsequent get returns None.
+        assert get_task("tid-del-1") is None
+
+    def test_delete_missing_returns_false(self, storage_db: Path) -> None:
+        init_db()
+        assert delete_task("tid-never-existed") is False
+
+    def test_delete_does_not_touch_siblings(self, storage_db: Path) -> None:
+        init_db()
+        insert_task(TaskRecord(task_id="tid-keep", mode="t2v", prompt_excerpt="k"))
+        insert_task(TaskRecord(task_id="tid-drop", mode="t2v", prompt_excerpt="d"))
+        assert delete_task("tid-drop") is True
+        # Sibling still present.
+        assert get_task("tid-keep") is not None
+        assert get_task("tid-drop") is None
 
 
 # ============================================================ v0.1.4 upload sweep

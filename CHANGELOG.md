@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.3] - 2026-09-02
+
+### Added
+- **提交防连点（防止重复扣费）**：`submitTask()` 入口加守卫 `if (btn.disabled) return`；校验通过后立刻 `btn.disabled = true` + 按钮文案改为「⏳ 提交中…」+ 状态栏写明「正在提交：上传素材 → 优化提示词 → 创建任务，请勿重复点击…（已勾选等待结果，可能需 15-30 分钟）」；`finally` 块恢复原状态，成功也恢复以便用户改参数再发。CSS 加 `.btn:disabled { opacity: .5; cursor: not-allowed; }`。
+- **任务列表 10s 自动刷新 + 中文状态 + 进行中呼吸动画**：`loadTasks()` 引入 `STATUS_CN` 映射表（running/processing/Queuing/Pending/succeeded/Success/failed/Failed 等 → 进行中/处理中/排队中/已完成/失败），渲染时 `STATUS_CN[t.status] || t.status`，CSS class 仍用原始 status 值保证配色命中。进行中状态加 `@keyframes taskPulse`（opacity 1 ↔ .45，1.6s 循环），让用户能直观看到任务在跑。刷新频率由 5s 改为 10s，且 `setInterval` 内部加 `if (!document.hidden)` 守卫，后台标签页不浪费 MiniMax 配额。
+- **详情面板非终态自动轮询**：模块级 `currentDetailId` / `detailPollTimer`；`showTask()` 入口先 `clearTimeout` 旧 timer、记账 id，结尾若状态非 `success|fail` 则 10 秒后再调一次自己（带面板可见 + id 一致双重校验，避免重复 fetch）；`closeDetail()` 同时清 timer / 重置 id。
+- **任务本地记录删除（`DELETE /api/tasks/{task_id}`）**：后端 `storage.delete_task(task_id)`（删行，rowcount>0 返回 True，否则 False）+ `web.py` 新增 `@app.delete("/api/tasks/{task_id}")` 路由，docstring 明确「只删本地记录，不取消 MiniMax 侧任务（API 不支持取消），不删已下载的视频文件」。UI 在任务列表行内加红色「删除」链接：进行中任务二次确认提示「删除只移除本地记录，MiniMax 侧仍会继续生成并计费」；已完成任务提示「不会删除已下载的视频文件」。删除成功自动关闭详情（若打开的就是该任务）并刷新列表。
+
 ## [0.2.2] - 2026-09-02
 
 ### Added

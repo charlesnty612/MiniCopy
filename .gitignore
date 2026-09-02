@@ -35,3 +35,6 @@ dist/
 HANDOFF-*.md
 .zcode/
 image_001.jpg
+
+# build logs
+*.log

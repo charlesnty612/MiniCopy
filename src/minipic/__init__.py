@@ -1,3 +1,3 @@
 """minipic — local CLI + web UI for MiniMax H3 video generation."""
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
