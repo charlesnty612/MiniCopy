@@ -1,0 +1,37 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local config and caches (per-user, never commit)
+config.json
+.minipic-cache/
+videos/
+!videos/.gitkeep
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Dist
+dist/
+build/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Internal working notes / session artifacts (not for publishing)
+HANDOFF-*.md
+.zcode/
+image_001.jpg
