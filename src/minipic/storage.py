@@ -158,6 +158,27 @@ def list_tasks(limit: int = 50) -> list[TaskRecord]:
     return [_row_to_record(r) for r in rows]
 
 
+# ============================================================ v0.2.3 delete local record
+
+def delete_task(task_id: str) -> bool:
+    """Delete the local SQLite record for ``task_id``.
+
+    Returns True if a row was actually deleted (cursor.rowcount > 0), False if
+    the id was not present. The corresponding MiniMax-side task is **not**
+    cancelled (the V2 API exposes no cancel endpoint); this only removes the
+    local row so the UI / list view stops tracking it. Any video file already
+    downloaded to ``cfg.videos_dir`` is intentionally left untouched — users
+    can still download it via ``GET /api/tasks/{task_id}/download`` while the
+    row exists, and removing the row makes that path 404. If you want to
+    evict the file as well, do it from the caller; the storage layer only
+    owns the SQLite ledger.
+    """
+    init_db()
+    with _conn() as c:
+        cur = c.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+        return cur.rowcount > 0
+
+
 def _row_to_record(row: sqlite3.Row) -> TaskRecord:
     extra_raw = row["extra"] or "{}"
     try:

@@ -379,6 +379,24 @@ input:disabled, select:disabled { background: rgba(8, 14, 28, 0.35); color: var(
 }
 .task-list a:hover { background: var(--accent-soft); text-decoration: none; }
 
+/* v0.2.3 — in-progress tasks gently pulse so users can see they're alive */
+@keyframes taskPulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+.task-status.running,
+.task-status.Processing,
+.task-status.processing,
+.task-status.Queuing,
+.task-status.Pending,
+.task-status.queued {
+  animation: taskPulse 1.6s ease-in-out infinite;
+}
+
+/* v0.2.3 — delete affordance for the task list */
+.task-del { color: var(--danger); margin-left: 8px; }
+.task-del:hover { color: #ff8fab; background: var(--danger-soft); }
+
+/* v0.2.3 — disabled submit button (defends against double-click submits) */
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
 /* ============ Detail panel */
 .detail-json {
   background: rgba(4, 8, 18, 0.7);
@@ -739,6 +757,11 @@ a:hover { color: #7fe0ff; }
 <script>
 const BASE = '/api';
 let taskCount = 0;
+// v0.2.3 — detail-panel state for auto-refreshing a task's status while it's
+// still non-terminal. A setTimeout (not setInterval) means the next poll is
+// only armed after the current fetch settles, so we never pile up requests.
+let currentDetailId = null;
+let detailPollTimer = null;
 
 function $(id) { return document.getElementById(id); }
 
@@ -857,12 +880,21 @@ function flashError(fieldId) {
 }
 
 async function submitTask() {
+  // v0.2.3 — guard against accidental double-clicks that produce duplicate
+  // (paid) MiniMax tasks. The button stays disabled for the entire round
+  // trip; finally restores state so the user can tweak & re-submit.
+  const btn = $('submit-btn');
+  if (btn.disabled) return;
   setMsg('', false);
   const payload = buildPayload();
   if (!payload.prompt) { setMsg('请填写提示词', true); flashError('prompt'); return; }
   if (payload.mode === 'i2v' && payload.ref_images.length === 0) {
     setMsg('请填写首帧图路径', true); flashError('i2v-first-path'); return;
   }
+  btn.disabled = true;
+  const origText = btn.textContent;
+  btn.textContent = '⏳ 提交中…';
+  setMsg('正在提交：上传素材 → 优化提示词 → 创建任务，请勿重复点击…' + (payload.wait ? '（已勾选等待结果，可能需 15-30 分钟）' : ''), false);
   try {
     const res = await fetch(BASE + '/create', {
       method: 'POST',
@@ -881,6 +913,9 @@ async function submitTask() {
     loadTasks();
   } catch(e) {
     setMsg('网络错误: ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
   }
 }
 
@@ -948,17 +983,35 @@ async function loadTasks() {
       ul.innerHTML = '<li style="color:#999">暂无任务</li>';
       return;
     }
+    // v0.2.3 — translate raw API status tokens to Chinese for the user-facing
+    // label. The CSS class still uses the raw token so the existing colour
+    // rules (.task-status.succeeded / .Processing / ...) keep matching.
+    const STATUS_CN = {
+      running: '进行中',
+      processing: '处理中',
+      Processing: '处理中',
+      queued: '排队中',
+      Queuing: '排队中',
+      Pending: '排队中',
+      submitted: '已提交',
+      succeeded: '已完成',
+      Success: '已完成',
+      failed: '失败',
+      Failed: '失败',
+    };
     ul.innerHTML = tasks.map(function(t) {
       const time = new Date(t.submitted_at).toLocaleString('zh-CN', {timeZone:'Asia/Shanghai'});
       const dl = (t.output_path || (t.status === 'Success' || t.status === 'succeeded'))
         ? '<a href="#" onclick="downloadTask(\'' + t.task_id + '\');return false">下载</a>'
         : '';
+      const cnLabel = STATUS_CN[t.status] || t.status;
       return '<li>' +
         '<span class="task-id">' + escHtml(t.task_id) + '</span> ' +
         '<span class="task-mode">' + escHtml(t.mode) + '</span> ' +
-        '<span class="task-status ' + escHtml(t.status) + '">' + escHtml(t.status) + '</span> ' +
+        '<span class="task-status ' + escHtml(t.status) + '">' + escHtml(cnLabel) + '</span> ' +
         '<span class="ts">' + time + '</span> ' +
         '<a href="#" onclick="showTask(\'' + t.task_id + '\');return false">详情</a> ' +
+        '<a href="#" class="task-del" onclick="deleteTask(\'' + t.task_id + '\', \'' + escHtml(t.status) + '\');return false">删除</a> ' +
         dl +
       '</li>';
     }).join('');
@@ -968,6 +1021,10 @@ async function loadTasks() {
 }
 
 async function showTask(taskId) {
+  // v0.2.3 — claim the detail panel for this task and cancel any previous
+  // pending poll so we never have overlapping fetches in flight.
+  currentDetailId = taskId;
+  if (detailPollTimer) { clearTimeout(detailPollTimer); detailPollTimer = null; }
   try {
     const res = await fetch(BASE + '/tasks/' + taskId);
     if (!res.ok) {
@@ -1008,15 +1065,49 @@ async function showTask(taskId) {
     }
     $('detail-dl-btn').innerHTML = dl;
     $('detail-panel').style.display = 'block';
+
+    // v0.2.3 — non-terminal tasks get an auto-refresh so the user can watch
+    // progress without re-clicking 详情. Terminal states stop the loop.
+    if (!/success|fail/i.test(t.status) && currentDetailId === taskId) {
+      detailPollTimer = setTimeout(function() {
+        // Only re-fire if the user is still looking at *this* task and the
+        // panel is still visible (closeDetail() flips both to null/false).
+        if ($('detail-panel').style.display === 'block' && currentDetailId === taskId) {
+          showTask(taskId);
+        }
+      }, 10000);
+    }
   } catch(e) {
     alert('加载失败: ' + e.message);
   }
 }
 
-function closeDetail() { $('detail-panel').style.display = 'none'; }
+function closeDetail() {
+  // v0.2.3 — also cancel any in-flight auto-refresh timer.
+  currentDetailId = null;
+  if (detailPollTimer) { clearTimeout(detailPollTimer); detailPollTimer = null; }
+  $('detail-panel').style.display = 'none';
+}
 
 function downloadTask(taskId) {
   window.location.href = '/api/tasks/' + taskId + '/download';
+}
+
+// v0.2.3 — remove the local SQLite record for a task. The MiniMax-side job
+// keeps running if it's still in flight (the V2 API has no cancel endpoint),
+// so we warn the user explicitly before doing this.
+async function deleteTask(taskId, status) {
+  const running = !/success|fail/i.test(status);
+  const tip = running
+    ? '该任务仍在进行中。\n删除只移除本地记录，MiniMax 侧仍会继续生成并计费（API 不支持取消）。\n确定删除？'
+    : '确定删除该任务记录？\n（不会删除已下载的视频文件）';
+  if (!confirm(tip)) return;
+  try {
+    const res = await fetch(BASE + '/tasks/' + taskId, { method: 'DELETE' });
+    if (!res.ok) { setMsg('删除失败: ' + res.status, true); return; }
+    if (currentDetailId === taskId) closeDetail();
+    loadTasks();
+  } catch(e) { setMsg('删除失败: ' + e.message, true); }
 }
 
 function escHtml(s) {
@@ -1026,7 +1117,9 @@ function escHtml(s) {
 
 // Poll
 loadTasks();
-setInterval(loadTasks, 5000);
+// v0.2.3 — was 5s in older builds, slowed to 10s; skip when tab is hidden
+// so a background tab doesn't burn MiniMax quota.
+setInterval(function() { if (!document.hidden) loadTasks(); }, 10000);
 
 // -------- API Key dialog --------
 let modelConstraints = null;  // populated by loadConfigStatus()
