@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minipic"
-version = "0.2.0"
+version = "0.2.1"
 description = "Local CLI + web UI for MiniMax H3 video generation (T2V / I2V / R2V)."
 readme = "README.md"
 requires-python = ">=3.10"

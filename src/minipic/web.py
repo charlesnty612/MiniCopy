@@ -360,7 +360,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         absolute path the user already has on disk; this endpoint does not
         resolve remote URLs.
 
-        Raises 404 if the file is missing or ffprobe fails (e.g. corrupt).
+        Raises 404 if the file is missing or probe fails (e.g. corrupt).
         """
         p = Path(path)
         if not p.is_file():

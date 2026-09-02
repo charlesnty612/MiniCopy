@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 from pathlib import Path
@@ -66,38 +65,84 @@ class TestFindFfmpeg:
 
 # --------------------------------------------------------------------------- ffprobe_duration
 class TestFfprobeDuration:
-    def test_parses_json_duration(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """v0.2.1+: ffprobe_duration uses ffmpeg -i probe (no ffprobe dep)."""
+
+    def _fake_completed(self, stderr: str = "", returncode: int = 1) -> Any:
+        """Build a fake CompletedProcess-like object."""
+        cp = MagicMock()
+        cp.stderr = stderr
+        cp.stdout = ""
+        cp.returncode = returncode
+        return cp
+
+    def test_parses_duration_from_stderr(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         video = tmp_path / "v.mp4"
         video.write_bytes(b"fake")
-        monkeypatch.setenv("PATH", "")
+        fake_stderr = (
+            "Input #0, mov,mp4,m4a, from 'v.mp4':\n"
+            "  Duration: 00:00:17.77, start: 0.000000, bitrate: 1234 kb/s\n"
+        )
 
-        def fake_check_output(cmd: list, **kwargs: Any) -> str:
-            assert "ffprobe" in cmd[0]
-            return json.dumps({"format": {"duration": "12.345"}})
+        def fake_run(cmd: list, **kwargs: Any) -> Any:
+            assert "ffmpeg" in Path(cmd[0]).name.lower() or "ffmpeg" in cmd[0].lower()
+            assert "-hide_banner" in cmd
+            assert str(video) in cmd[-1]
+            return self._fake_completed(stderr=fake_stderr)
 
-        with patch("subprocess.check_output", fake_check_output):
+        with patch("subprocess.run", fake_run):
             dur = ffprobe_duration(video)
-        assert dur == pytest.approx(12.345, rel=1e-3)
+        assert dur == pytest.approx(17.77, rel=1e-3)
 
-    def test_raises_on_subprocess_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        video = tmp_path / "v.mp4"
+    def test_parses_duration_with_hours(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        video = tmp_path / "long.mp4"
         video.write_bytes(b"fake")
+        fake_stderr = "  Duration: 01:02:03.50, start: 0.0\n"
 
-        def fake_check_output(cmd: list, **kwargs: Any) -> None:
-            raise subprocess.CalledProcessError(1, cmd)
+        with patch("subprocess.run", lambda *a, **k: self._fake_completed(stderr=fake_stderr)):
+            dur = ffprobe_duration(video)
+        # 1*3600 + 2*60 + 3.5 = 3723.5
+        assert dur == pytest.approx(3723.5, rel=1e-3)
 
-        with patch("subprocess.check_output", fake_check_output):
-            with pytest.raises(MediaError, match="ffprobe failed"):
+    def test_raises_when_no_duration_in_output(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        video = tmp_path / "broken.mp4"
+        video.write_bytes(b"fake")
+        fake_stderr = "some unrelated ffmpeg noise with no Duration line\n"
+
+        with patch("subprocess.run", lambda *a, **k: self._fake_completed(stderr=fake_stderr)):
+            with pytest.raises(MediaError, match="无法读取媒体时长"):
                 ffprobe_duration(video)
 
-    def test_raises_on_missing_file(self, tmp_path: Path) -> None:
-        # On Windows the system ffprobe is installed; mock to isolate test.
-        def fake_check_output(cmd: list, **kwargs: Any) -> None:
-            raise subprocess.CalledProcessError(1, cmd)
+    def test_raises_on_subprocess_oserror(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"fake")
 
-        with patch("subprocess.check_output", fake_check_output):
-            with pytest.raises(MediaError, match="ffprobe failed"):
-                ffprobe_duration(tmp_path / "nonexistent.mp4")
+        def fake_run(cmd: list, **kwargs: Any) -> Any:
+            raise FileNotFoundError("[WinError 2] The system cannot find the file specified")
+
+        with patch("subprocess.run", fake_run):
+            with pytest.raises(MediaError, match="media probe failed"):
+                ffprobe_duration(video)
+
+    def test_raises_on_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"fake")
+
+        def fake_run(cmd: list, **kwargs: Any) -> Any:
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        with patch("subprocess.run", fake_run):
+            with pytest.raises(MediaError, match="media probe failed"):
+                ffprobe_duration(video)
 
 
 # --------------------------------------------------------------------------- VideoClip
