@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.4] - 2026-09-02
+
+### Changed
+- **绿色包启动自动接管旧版 MiniCopy**：`src/minipic/frozen_main.py` 探测 7860 端口被占时，先用 `netstat -ano` 查占用者 PID + `tasklist` 查映像名，若确认是 `MiniCopy.exe` 就 `taskkill /F /PID` 自动结束旧实例，轮询等端口释放（≤5s）后正常启动新版本。映像名比对**在 taskkill 之前**，绝不误杀非 MiniCopy 进程。端口被非 MiniCopy 程序占用时明确打印 PID + 名称并 `sys.exit(1)`，不再误开浏览器。PID/映像名解析失败时维持旧的"已有实例 → 直接打开浏览器"兜底。**仅 Windows**；Linux/macOS 走原兜底分支并加注释说明（绿色包当前仅 Windows 打包）。
+- 旧版本升级体验：小白"双击新 exe"等于换上新版，无需先手动关闭旧黑窗口（真实事故已发生过的体验修复）。
+
 ## [0.2.3] - 2026-09-02
 
 ### Added

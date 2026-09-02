@@ -21,6 +21,7 @@
 - 下载 `MiniCopy-win64.zip`（或 `dist/MiniCopy/` 目录），解压到任意位置
 - 双击 `MiniCopy.exe` 启动；首次运行 Windows 防火墙弹窗请点"允许访问"
 - 浏览器会自动打开 http://127.0.0.1:7860 ；右上角配置 API Key
+- **升级无需手动关闭旧窗口**：下载新版本后直接双击新 exe 即可，旧版 `MiniCopy.exe` 会被自动识别并结束，端口释放后新版本立即接管。端口若被非 MiniCopy 程序占用会明确报错退出，不会误开浏览器。
 - 用完直接关掉黑窗口即停止（不要强行结束进程，可能丢失未写完的日志）
 - **仅支持 Windows 64 位**；Linux / macOS 用户需在对应平台上重新运行 `scripts/build_exe.sh`
 
