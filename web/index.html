@@ -637,7 +637,7 @@ a:hover { color: #7fe0ff; }
     <label for="model">模型</label>
     <select id="model">
       <option value="MiniMax-H3" selected>MiniMax-H3（默认 · 768P/2K · 4-15s · 全能力 · 首帧/尾帧）</option>
-      <option value="MiniMax-H3-Max">MiniMax-H3-Max（480P/768P · 5-15s · 无多模态参考 · 首帧/尾帧）</option>
+      <option value="MiniMax-H3-Max">MiniMax-H3-Max（480P/768P · 5-15s · 支持全能参考 · 首帧/尾帧）</option>
     </select>
 
     <label for="prompt" data-required="true">提示词</label>
@@ -1190,7 +1190,7 @@ function applyModelConstraints() {
   const modes = c.modes || ['t2v', 'i2v', 'r2v'];
   if (currentMode === 'r2v' && modes.indexOf('r2v') === -1) {
     document.querySelector('input[name="mode"][value="t2v"]').checked = true;
-    alert('H3-Max 不支持多模态参考（r2v），已自动切换到 t2v');
+    alert('当前模型不支持多模态参考（r2v），已自动切换到 t2v');
     updateModeUI();
   }
 

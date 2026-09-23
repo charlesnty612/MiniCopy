@@ -641,7 +641,7 @@ def _validate_mode(body: CreateBody) -> None:
                 status_code=400,
                 detail="r2v mode requires at least one reference (image, video, or audio)",
             )
-        # 多模态参考能力由模型决定：H3 支持，H3-Max 不支持。
+        # 多模态参考能力由模型决定：H3 与 H3-Max 均支持 r2v（参考图/参考视频/参考音频）。
         try:
             validate_model_modes(body.model, mode="r2v")
         except ConfigError as e:

@@ -14,9 +14,9 @@
 | 模型 | 模式 | i2v 帧 | 分辨率 | 时长 |
 |------|------|--------|--------|------|
 | `MiniMax-H3` | t2v / i2v / r2v | 首帧 / 尾帧 | 768P / 2K | 4–15s |
-| `MiniMax-H3-Max` | t2v / i2v | 首帧 / 尾帧 | 480P / 768P | 5–15s |
+| `MiniMax-H3-Max` | t2v / i2v / r2v | 首帧 / 尾帧 | 480P / 768P | 5–15s |
 
-- H3-Max **不支持多模态参考（r2v）**，也不支持中间帧（官方 API schema 的 role 枚举只有 `first_frame` / `last_frame` / `reference_*`，没有 `middle_frame`）。
+- H3-Max 仍**不支持中间帧**（官方 API schema 的 role 枚举只有 `first_frame` / `last_frame` / `reference_*`，没有 `middle_frame`）。
 - 参考视频 / 音频仅支持 **≤15s 单段**（多段生成已移除，>15s 会报错提示先截取）。
 
 ## 安装

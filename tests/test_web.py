@@ -1138,7 +1138,8 @@ class TestApiConfigEndpoints:
         assert "2K" not in max_m["resolutions"]
         assert max_m["duration_min"] == 5
         # v0.2.2+: server version is exposed to the UI for footer display
-        assert data["version"] == "0.2.4"
+        from minipic import __version__
+        assert data["version"] == __version__
 
     def test_get_handles_missing_key(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1483,20 +1484,20 @@ class TestApiCreateModelValidation:
         kwargs = fake.create_video_task.await_args.kwargs
         assert kwargs["model"] == "MiniMax-H3"
 
-    def test_h3_max_rejects_r2v(
+    def test_h3_max_accepts_r2v(
         self, web_client: TestClient, fake_client_factory
     ) -> None:
-        """H3-Max + r2v → 400，明确提示不支持多模态参考。"""
+        """H3-Max + r2v → 通过校验，正常提交。"""
+        fake = fake_client_factory()
+        fake.create_video_task.return_value = "tid-h3m-r2v"
         resp = web_client.post("/api/create", json={
             "mode": "r2v", "prompt": "x", "resolution": "768P",
             "model": "MiniMax-H3-Max",
-            "ref_images": [{"path": "/a.jpg", "role": "reference_image"}],
+            "ref_images": [{"path": "https://cdn/a.jpg", "role": "reference_image"}],
         })
-        assert resp.status_code == 400
-        detail = resp.json()["detail"]
-        assert "MiniMax-H3-Max" in detail
-        assert "r2v" in detail
-        assert "不支持多模态参考" in detail
+        assert resp.status_code == 200, resp.text
+        kwargs = fake.create_video_task.await_args.kwargs
+        assert kwargs["model"] == "MiniMax-H3-Max"
 
     def test_h3_accepts_r2v(
         self, web_client: TestClient, fake_client_factory
@@ -1651,7 +1652,7 @@ class TestApiConfigModeCapabilities:
         h3m = next(m for m in data["models"] if m["name"] == "MiniMax-H3-Max")
         assert h3["modes"] == ["t2v", "i2v", "r2v"]
         assert h3["i2v_roles"] == ["first_frame", "last_frame"]
-        assert h3m["modes"] == ["t2v", "i2v"]
+        assert h3m["modes"] == ["t2v", "i2v", "r2v"]
         assert h3m["i2v_roles"] == ["first_frame", "last_frame"]
 
 

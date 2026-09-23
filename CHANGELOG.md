@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.5] - 2026-09-23
+
+### Changed
+- **放开 MiniMax-H3-Max 全能参考（r2v）支持**：官方文档（platform.minimax.cn/docs/guides/video-generation，2026-09 版）确认 H3 Max 已支持全能参考生成，content[] role 枚举与 H3 一致、输入条件两模型共用。`MODEL_CONSTRAINTS["MiniMax-H3-Max"]["modes"]` 加入 `"r2v"`（`src/minipic/config.py`），删除 `validate_model_modes()` 的 H3-Max r2v 拒绝 hint；Web UI 模型选项文案与回退 alert 改为支持/通用表述（`web/index.html`）；README 与 docs/ARCHITECTURE.md 能力表同步。纯放开本地校验，API content[] 结构零改动。
+- 测试反转：`test_config.py` / `test_cli.py` / `test_web.py` 中 H3-Max+r2v 的拒绝断言反转为接受断言（含 model 透传与 `/api/config` modes 端到端断言）。
+
+### Notes
+- 未改动：Context-IR 仍仅支持 H3（既有 guard 保留）；`media.py` 参考视频/音频单段 2-15s 限制保留（两模型共用同一 cap；若官方对 H3-Max 另有更严限制，以后实测到服务端拒绝再补分支常量）。
+
 ## [0.2.4] - 2026-09-02
 
 ### Changed

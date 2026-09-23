@@ -730,11 +730,11 @@ class TestCreateModelFlag:
         kwargs = fake_client.create_video_task.await_args.kwargs
         assert kwargs["model"] == "MiniMax-H3-Max"
 
-    def test_r2v_with_h3_max_rejected(
+    def test_r2v_with_h3_max_accepted(
         self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient,
         tmp_path: Path,
     ) -> None:
-        """H3-Max 不支持多模态参考（r2v），CLI 必须拒绝而不是提交到后端。"""
+        """H3-Max 已放开 r2v（多模态参考），CLI 必须正常提交，model 正确传给后端。"""
         img = tmp_path / "img.jpg"
         img.write_bytes(b"x")
         result = runner.invoke(main, [
@@ -744,11 +744,10 @@ class TestCreateModelFlag:
             "--model", "MiniMax-H3-Max",
             "--resolution", "480P", "--duration", "5",
         ])
-        assert result.exit_code != 0
-        assert "不支持模式 r2v" in result.output
-        assert "不支持多模态参考" in result.output
-        # 校验发生在提交前，fake client 不应被调用
-        assert fake_client.create_video_task.await_args is None
+        assert result.exit_code == 0, result.output
+        # 提交发生过，model 正确传给后端
+        kwargs = fake_client.create_video_task.await_args.kwargs
+        assert kwargs["model"] == "MiniMax-H3-Max"
 
     def test_r2v_with_h3(
         self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient,

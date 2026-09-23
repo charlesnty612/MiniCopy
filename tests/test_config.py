@@ -458,9 +458,9 @@ class TestModelRegistry:
     def test_h3_max_modes_and_roles(self) -> None:
         from minipic.config import MODEL_CONSTRAINTS
         h3m = MODEL_CONSTRAINTS["MiniMax-H3-Max"]
-        assert h3m["modes"] == ["t2v", "i2v"]
-        # H3-Max 不支持 r2v 与中间帧
-        assert "r2v" not in h3m["modes"]
+        # H3-Max 已放开多模态参考（r2v），但仍不支持中间帧。
+        assert h3m["modes"] == ["t2v", "i2v", "r2v"]
+        assert "r2v" in h3m["modes"]
         assert "middle_frame" not in h3m["i2v_roles"]
         assert h3m["i2v_roles"] == ["first_frame", "last_frame"]
 
@@ -546,16 +546,10 @@ class TestValidateModelModes:
         with pytest.raises(_ConfigError, match="middle_frame"):
             validate_model_modes("MiniMax-H3-Max", mode="i2v", i2v_role="middle_frame")
 
-    def test_h3_max_rejects_r2v_with_hint(self) -> None:
+    def test_h3_max_accepts_r2v(self) -> None:
+        # H3-Max 已放开 r2v 支持（多模态参考）；validate_model_modes 不应再抛错。
         from minipic.config import validate_model_modes
-        with pytest.raises(_ConfigError) as ei:
-            validate_model_modes("MiniMax-H3-Max", mode="r2v")
-        msg = str(ei.value)
-        assert "MiniMax-H3-Max" in msg
-        assert "r2v" in msg
-        # 必须给出明确的回退提示
-        assert "不支持多模态参考" in msg
-        assert "MiniMax-H3" in msg
+        validate_model_modes("MiniMax-H3-Max", mode="r2v")  # ok
 
     def test_h3_max_first_and_last_pass(self) -> None:
         from minipic.config import validate_model_modes

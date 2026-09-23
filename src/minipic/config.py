@@ -52,9 +52,10 @@ MODEL_CONSTRAINTS: dict[str, dict[str, Any]] = {
         "resolutions": ["480P", "768P"],
         "duration_min": 5,
         "duration_max": 15,
-        # H3-Max 极速版：仅文生视频与图生视频（首帧/尾帧），
-        # 不支持中间帧与多模态参考（参考图/参考视频/参考音频）。
-        "modes": ["t2v", "i2v"],
+        # H3-Max 极速版：文生视频、图生视频（首帧/尾帧），
+        # 多模态参考（参考图/参考视频/参考音频，r2v）。
+        # 仍不支持中间帧（i2v_roles 仅 first/last_frame）。
+        "modes": ["t2v", "i2v", "r2v"],
         "i2v_roles": ["first_frame", "last_frame"],
     },
 }
@@ -115,7 +116,7 @@ def validate_model_modes(
 
     - model 不在 MODEL_CONSTRAINTS → ConfigError。
     - mode 不为 None 且不在 constraints["modes"] → ConfigError，
-      文案含模型名、模式名与支持列表，并对 H3-Max 的 r2v 给出明确提示。
+      文案含模型名、模式名与支持列表。
     - i2v_role 不为 None 且不在 constraints["i2v_roles"] → ConfigError，
       文案含模型名、角色名与支持列表。
     """
@@ -127,14 +128,8 @@ def validate_model_modes(
 
     if mode is not None and mode not in constraints["modes"]:
         supported = ", ".join(constraints["modes"])
-        hint = ""
-        if model == "MiniMax-H3-Max" and mode == "r2v":
-            hint = (
-                "；H3-Max 不支持多模态参考（参考图/参考视频/参考音频），"
-                "请改用 MiniMax-H3 或 t2v/i2v"
-            )
         raise ConfigError(
-            f"模型 {model} 不支持模式 {mode}（支持: {supported}）{hint}"
+            f"模型 {model} 不支持模式 {mode}（支持: {supported}）"
         )
 
     if i2v_role is not None and i2v_role not in constraints["i2v_roles"]:
