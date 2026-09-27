@@ -432,6 +432,14 @@ input:disabled, select:disabled { background: rgba(8, 14, 28, 0.35); color: var(
 }
 .detail-usage b { color: var(--warn); }
 
+/* v0.2.7 — 任务详情结构化字段视图 */
+.detail-fields { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 6px 0 10px; font-size: 0.9rem; }
+.detail-fields > div { display: contents; }
+.detail-label { color: var(--fg-2); font-weight: 600; padding-right: 6px; }
+.detail-raw { margin-top: 10px; font-size: 0.85rem; color: var(--fg-2); }
+.detail-raw summary { cursor: pointer; padding: 4px 0; }
+.detail-raw pre { background: rgba(0,0,0,0.04); padding: 8px; border-radius: 4px; }
+
 /* checkbox */
 .checkbox-label {
   display: flex;
@@ -753,6 +761,7 @@ a:hover { color: #7fe0ff; }
     <h3>任务详情</h3>
     <div id="detail-ir" style="display:none;margin-bottom:8px"></div>
     <div id="detail-usage" class="detail-usage" style="display:none"></div>
+    <!-- detail-json：历史 id（早期版本直接 textContent 写 JSON），现承载任务详情结构化视图；原始 JSON 在内部 <details> 折叠块。id 保持不变以避免破坏既有 CSS / 引用 -->
     <div id="detail-json" class="detail-json"></div>
     <p style="margin-top:8px;font-size:0.85rem">
       <span id="detail-dl-btn"></span>
@@ -777,6 +786,23 @@ let taskCount = 0;
 // only armed after the current fetch settles, so we never pile up requests.
 let currentDetailId = null;
 let detailPollTimer = null;
+// 任务完成通知的基线状态：key=task_id, value=上次 status。首次载入只建基线，
+// 从非终态→终态的迁移触发浏览器通知与标题闪烁。
+let prevTaskStatus = {};
+// v0.2.7 — 失败/完成闪烁用：原始标题缓存（窗口 focus 时恢复）
+let originalTitle = document.title;
+
+// v0.2.7 — 官方刊例价（按量计费 #视频）。
+// 来源：https://platform.minimax.cn/docs/guides/pricing-paygo#视频
+// ⚠ 刊例价可能调整，调价时改这里即可（前端是当前唯一估算点）。
+//   out:    输出视频按秒单价（按分辨率）
+//   inVideo: 输入参考视频按秒单价（按分辨率；音频免费不计）
+//   imgFree: 输入参考图免费阈值；imgPrice: 超额单张价
+// Context-IR token 费（输入 5.8 / 输出 23 元/百万 token）不纳入估算，展示时另行注明。
+const PRICING = {
+  "MiniMax-H3":     { out: {"768P": 0.50, "2K": 0.80}, inVideo: {"768P": 0.50, "2K": 0.80}, imgFree: 5, imgPrice: 0.20 },
+  "MiniMax-H3-Max": { out: {"480P": 0.33, "768P": 0.50}, inVideo: {"480P": 0.37, "768P": 0.97}, imgFree: 2, imgPrice: 0.50 },
+};
 
 function $(id) { return document.getElementById(id); }
 
@@ -950,6 +976,13 @@ async function submitTask() {
       '<a href="#" onclick="showTask(\'' + data.task_id + '\');return false">查看状态</a>';
     showTask(data.task_id);
     loadTasks();
+    // v0.2.7 — 在用户手势上下文里懒请求系统通知权限（仅弹一次，浏览器会记忆选择）。
+    // .catch 吞掉用户拒绝/环境不支持导致的 Promise rejection：失败路径已被
+    // 「标题闪烁 + 已授权才弹 Notification」兜底覆盖，无需额外提示用户。
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      try { Notification.requestPermission().catch(function() { /* 拒绝/不支持：标题闪烁兜底 */ }); }
+      catch (_) { /* Notification 构造函数自身抛错（极旧浏览器） */ }
+    }
   } catch(e) {
     setMsg('网络错误: ' + e.message, true);
   } finally {
@@ -1013,6 +1046,47 @@ function pickFile(btn, accept) {
   fi.click();
 }
 
+// v0.2.7 — 状态 → 中文映射（任务列表 / 详情共用）。
+// 已知 token（大小写混杂）与终态/进行中分类；未知 token 原样显示在灰色兜底里。
+const STATUS_CN = {
+  running: '进行中',
+  processing: '处理中',
+  Processing: '处理中',
+  queued: '排队中',
+  Queuing: '排队中',
+  Pending: '排队中',
+  submitted: '已提交',
+  succeeded: '已完成',
+  Success: '已完成',
+  failed: '失败',
+  Failed: '失败',
+  cancelled: '已取消',
+  Cancelled: '已取消',
+  expired: '已过期',
+  Expired: '已过期',
+};
+// v0.2.7 — 模式 → 中文映射。
+const MODE_CN = { t2v: '文生视频', i2v: '图生视频', r2v: '多模态参考' };
+
+function statusToCN(s) { return (STATUS_CN[s] != null) ? STATUS_CN[s] : s; }
+function modeToCN(m) { return (MODE_CN[m] != null) ? MODE_CN[m] : (m || '—'); }
+
+// v0.2.7 — 提示词摘要：取前 N 字，超长省略号。
+function promptExcerpt(s, n) {
+  s = (s == null) ? '' : String(s);
+  if (s.length <= n) return s;
+  return s.slice(0, n) + '…';
+}
+
+// v0.2.7 — 错误信息可读化：去掉 request_id= 等噪声，保留括号错误码 (NNNN)。
+function humanizeError(msg) {
+  if (!msg) return '';
+  return String(msg)
+    .replace(/request_id\s*=\s*\S+/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 async function loadTasks() {
   try {
     const res = await fetch(BASE + '/tasks');
@@ -1022,41 +1096,61 @@ async function loadTasks() {
       ul.innerHTML = '<li style="color:#999">暂无任务</li>';
       return;
     }
-    // v0.2.3 — translate raw API status tokens to Chinese for the user-facing
-    // label. The CSS class still uses the raw token so the existing colour
-    // rules (.task-status.succeeded / .Processing / ...) keep matching.
-    const STATUS_CN = {
-      running: '进行中',
-      processing: '处理中',
-      Processing: '处理中',
-      queued: '排队中',
-      Queuing: '排队中',
-      Pending: '排队中',
-      submitted: '已提交',
-      succeeded: '已完成',
-      Success: '已完成',
-      failed: '失败',
-      Failed: '失败',
-    };
     ul.innerHTML = tasks.map(function(t) {
       const time = new Date(t.submitted_at).toLocaleString('zh-CN', {timeZone:'Asia/Shanghai'});
       const dl = (t.output_path || (t.status === 'Success' || t.status === 'succeeded'))
         ? '<a href="#" onclick="downloadTask(\'' + t.task_id + '\');return false">下载</a>'
         : '';
-      const cnLabel = STATUS_CN[t.status] || t.status;
+      const cnLabel = statusToCN(t.status);
+      // v0.2.7 — 列表可读性：mode 徽章后加提示词摘要（前 15 字），帮助用户辨认多个任务。
+      const excerpt = promptExcerpt(t.prompt_excerpt || '', 15);
       return '<li>' +
         '<span class="task-id">' + escHtml(t.task_id) + '</span> ' +
-        '<span class="task-mode">' + escHtml(t.mode) + '</span> ' +
+        '<span class="task-mode">' + escHtml(modeToCN(t.mode)) + '</span> ' +
         '<span class="task-status ' + escHtml(t.status) + '">' + escHtml(cnLabel) + '</span> ' +
+        '<span class="task-excerpt" style="color:#666;font-size:0.9em;margin-left:6px">' +
+          escHtml(excerpt) + '</span> ' +
         '<span class="ts">' + time + '</span> ' +
         '<a href="#" onclick="showTask(\'' + t.task_id + '\');return false">详情</a> ' +
         '<a href="#" class="task-del" onclick="deleteTask(\'' + t.task_id + '\', \'' + escHtml(t.status) + '\');return false">删除</a> ' +
         dl +
       '</li>';
     }).join('');
+    // v0.2.7 — 任务完成通知：非终态→终态迁移时触发浏览器通知 + 标题闪烁。
+    // 首次载入（prevTaskStatus 为空）只建基线，不通知；之后只在状态转换时通知。
+    const isFirstLoad = (Object.keys(prevTaskStatus).length === 0);
+    const nextPrev = {};
+    tasks.forEach(function(t) {
+      const id = t.task_id;
+      const newStatus = t.status;
+      nextPrev[id] = newStatus;
+      if (isFirstLoad) return;
+      const prev = prevTaskStatus[id];
+      if (prev && !/success|fail|cancel/i.test(prev) && /success|fail|cancel/i.test(newStatus)) {
+        notifyTerminal(id, newStatus);
+      }
+    });
+    prevTaskStatus = nextPrev;
   } catch(e) {
     $('task-list').innerHTML = '<li style="color:#c00">加载失败: ' + escHtml(e.message) + '</li>';
   }
+}
+
+// v0.2.7 — 完成通知：浏览器 Notification（如已授权）+ 标题闪烁，窗口 focus 后恢复。
+function notifyTerminal(taskId, status) {
+  const isFail = /fail/i.test(status);
+  const isCancel = /cancel/i.test(status);
+  const title = isFail ? 'MiniCopy 任务失败' : (isCancel ? 'MiniCopy 任务已取消' : 'MiniCopy 任务完成');
+  // 标题闪烁：仅在窗口未聚焦时改；focus 事件会恢复。
+  if (!document.hasFocus()) {
+    document.title = (isFail ? '【失败】' : (isCancel ? '【取消】' : '【完成】')) + originalTitle;
+  }
+  // 浏览器系统通知：仅在已授权时弹出，避免每次触发都请求权限（requestPermission 会重复弹窗打扰）。
+  try {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+      new Notification(title, { body: taskId + ' · ' + status });
+    }
+  } catch (_) { /* Notification API 异常时静默降级（沙盒 / 旧浏览器） */ }
 }
 
 async function showTask(taskId) {
@@ -1067,11 +1161,16 @@ async function showTask(taskId) {
   try {
     const res = await fetch(BASE + '/tasks/' + taskId);
     if (!res.ok) {
-      alert('任务不存在'); return;
+      // 抛到 catch，由 catch 统一处理：HTTP 404（任务真不存在/已删除）不重武装轮询，
+      // 其它错误显示「刷新失败，10s 后自动重试」并重新武装轮询。
+      throw new Error('HTTP ' + res.status);
     }
     const t = await res.json();
-    $('detail-json').textContent = JSON.stringify(t, null, 2);
-    // Context-IR 提示词优化标记（仅当后端持久化了 used_context_ir 时显示）
+    // v0.2.7 — 详情主视图不再裸 JSON；改为字段化中文视图。原始 JSON 折叠在 <details> 内默认收起。
+    // Context-IR 标记保留（detail-ir）；用量 / 费用保留 task-6 的三段式逻辑（详情结构化视图里展示）。
+    // 失败时错误信息可读化；成功且有 url 时显示下载按钮（detail-dl-btn）。
+
+    // —— 上下文-IR 提示 ——
     const irBox = $('detail-ir');
     const usedIR = !!(t.extra && t.extra.used_context_ir);
     if (usedIR) {
@@ -1080,23 +1179,116 @@ async function showTask(taskId) {
     } else {
       irBox.style.display = 'none';
     }
-    // 用量 / 费用展示（usage 由后端从 API 响应持久化到 extra）
+
+    // —— 三段式费用区块（保留 task-6 逻辑） ——
     const usageBox = $('detail-usage');
     const usage = (t.extra && t.extra.usage) || t.usage;
+    let costLineHtml = '';
     if (usage && (usage.total_seconds != null || usage.output_seconds != null)) {
       const totalSec = Number(usage.total_seconds || usage.output_seconds || 0);
-      // 按分辨率估算费用（国内官方刊例价）：768P ¥0.50/s、2K ¥0.80/s；480P 无公开单价，用 768P 近似
-      const rate = (t.resolution === '2K') ? 0.80 : 0.50;
-      const cost = (totalSec * rate).toFixed(2);
-      usageBox.innerHTML =
-        '⏱ 生成时长 ' + totalSec + 's' +
-        '（输入 ' + (usage.input_seconds != null ? usage.input_seconds + 's' : '—') +
-        ' / 输出 ' + (usage.output_seconds != null ? usage.output_seconds + 's' : '—') + '）' +
-        ' · 估算费用 <b>¥' + cost + '</b>';
+      const inSec = Number(usage.input_seconds || 0);
+      const imgCount = Number(usage.input_image_count || 0);
+      const inputLabel = inSec > 0 ? inSec + 's' : '—';
+      const outputLabel = (usage.output_seconds != null) ? usage.output_seconds + 's' : '—';
+      const durationLine = '⏱ 生成时长 ' + totalSec + 's（输入 ' + inputLabel + ' / 输出 ' + outputLabel + '）';
+
+      const price = (t.model && PRICING[t.model]) ? PRICING[t.model] : null;
+      const hasOutRate = price && t.resolution && price.out[t.resolution] != null;
+
+      let costHtml;
+      if (!hasOutRate) {
+        costHtml = ' · 估算费用 <b>—</b> <span style="color:#999">（旧记录缺少计费字段）</span>';
+      } else {
+        let outSec = null;
+        if (usage.output_seconds != null) {
+          outSec = Number(usage.output_seconds);
+        } else if (usage.input_seconds != null && usage.total_seconds != null) {
+          outSec = Number(usage.total_seconds) - Number(usage.input_seconds);
+          if (outSec < 0) outSec = 0;
+        }
+        if (outSec == null) {
+          costHtml = ' · 估算费用 <b>—</b> <span style="color:#999">（用量字段不足）</span>';
+        } else {
+          const outCost = outSec * price.out[t.resolution];
+          const inVideoCost = inSec * (price.inVideo[t.resolution] || 0);
+          const overImg = Math.max(0, imgCount - price.imgFree);
+          const imgCost = overImg * price.imgPrice;
+          const totalCost = outCost + inVideoCost + imgCost;
+          const lines = [];
+          lines.push('输出费 ¥' + outCost.toFixed(2));
+          if (inVideoCost > 0) lines.push('输入视频费 ¥' + inVideoCost.toFixed(2));
+          if (imgCost > 0)    lines.push('参考图超额费 ¥' + imgCost.toFixed(2));
+          costHtml =
+            ' · 估算费用 <b>¥' + totalCost.toFixed(2) + '</b>' +
+            '（刊例价估算，不含 Context-IR token 费，以账单为准）' +
+            '<br><span style="color:#666;font-size:0.9em">' +
+            lines.join(' · ') +
+            '</span>';
+        }
+      }
+      costLineHtml = durationLine + costHtml;
+      usageBox.innerHTML = costLineHtml;
       usageBox.style.display = 'block';
     } else {
       usageBox.style.display = 'none';
     }
+
+    // —— 失败错误信息（仅失败时显示，单独红色区块） ——
+    const errHtml = /fail|cancel/i.test(t.status)
+      ? '<div class="detail-err" style="background:#fff0f0;border:1px solid #fbb;color:#900;padding:8px 10px;border-radius:4px;margin:8px 0">' +
+        '<b>失败原因：</b>' + escHtml(humanizeError(t.error || t.message || '未知错误')) + '</div>'
+      : '';
+
+    // —— 参数行（缺失项跳过不显示） ——
+    const params = [];
+    if (t.duration != null) params.push('时长 ' + t.duration + 's');
+    if (t.resolution)        params.push(t.resolution);
+    if (t.ratio)             params.push(t.ratio);
+
+    // —— 提交时间 / 最近查询时间（last_query_at > 0 才显示） ——
+    const fmtTime = function(ms) {
+      if (!ms || isNaN(Number(ms))) return '';
+      return new Date(Number(ms)).toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'});
+    };
+    const submitTimeStr = fmtTime(t.submitted_at);
+    const lastQueryStr  = (t.last_query_at && t.last_query_at > 0) ? fmtTime(t.last_query_at) : '';
+
+    // —— 提示词摘要（尾部注明「前 100 字摘要」） ——
+    const promptFull = t.prompt_excerpt || '';
+    const promptTail = promptFull.length > 100
+      ? promptExcerpt(promptFull, 100) + '（前 100 字摘要）'
+      : promptFull;
+
+    // —— 结构化中文视图 ——
+    let html = '';
+    html += '<div class="detail-fields">';
+    html += '<div><span class="detail-label">状态</span>' +
+            '<span class="task-status ' + escHtml(t.status) + '">' + escHtml(statusToCN(t.status)) + '</span></div>';
+    html += '<div><span class="detail-label">任务 ID</span><span>' + escHtml(t.task_id) + '</span></div>';
+    html += '<div><span class="detail-label">模式</span><span>' + escHtml(modeToCN(t.mode)) + '</span></div>';
+    html += '<div><span class="detail-label">模型</span><span>' + escHtml(t.model || '—') + '</span></div>';
+    if (params.length > 0) {
+      html += '<div><span class="detail-label">参数</span><span>' + escHtml(params.join(' · ')) + '</span></div>';
+    }
+    if (submitTimeStr) {
+      html += '<div><span class="detail-label">提交时间</span><span>' + escHtml(submitTimeStr) + '</span></div>';
+    }
+    if (lastQueryStr) {
+      html += '<div><span class="detail-label">最近查询</span><span>' + escHtml(lastQueryStr) + '</span></div>';
+    }
+    if (promptTail) {
+      html += '<div><span class="detail-label">提示词</span><span>' + escHtml(promptTail) + '</span></div>';
+    }
+    html += '</div>';
+    html += errHtml;
+    html += '<details class="detail-raw"><summary>原始数据（调试用）</summary>' +
+            '<pre style="white-space:pre-wrap;word-break:break-all;margin:8px 0 0;font-size:0.85em;color:#555">' +
+            escHtml(JSON.stringify(t, null, 2)) + '</pre></details>';
+
+    const dj = $('detail-json');
+    dj.innerHTML = html;
+
+    // —— 成功且有 url → 显示下载按钮 ——
     let dl = '';
     const url = t.content_url || t.output_path;
     if (url) {
@@ -1117,7 +1309,36 @@ async function showTask(taskId) {
       }, 10000);
     }
   } catch(e) {
-    alert('加载失败: ' + e.message);
+    // v0.2.7 — fetch 失败时不再 alert 打断流程。把重试提示写到 detail-usage 区
+    // （避免覆盖 detail-json 中已有的详情内容），并在面板仍打开且非 404 时
+    // 重新武装轮询。404（任务真不存在/已删除）重试无意义，只显示一行提示。
+    // v0.2.7.1 — 首次 showTask 即失败时 detail-json 仍空白：检测无 .detail-fields 子元素
+    // 时写入「加载失败，正在重试…」占位，已有内容保持不动。
+    const msg = (e && e.message) ? e.message : '网络异常';
+    const is404 = /HTTP\s+404/.test(msg);
+    const dj = $('detail-json');
+    if (dj && !dj.querySelector('.detail-fields')) {
+      // 首次失败：主视图还没渲染过任何内容，给一行占位避免 10s 空白。
+      dj.innerHTML = '<div class="detail-fields"><div><span class="detail-label">状态</span>' +
+        '<span style="color:#999">加载失败，正在重试…（' + escHtml(msg) + '）</span></div></div>';
+    }
+    const ub = $('detail-usage');
+    if (ub) {
+      ub.innerHTML = is404
+        ? '<div style="color:#c00">任务不存在或已删除</div>'
+        : '<div style="color:#c00">刷新失败，10s 后自动重试（' + escHtml(msg) + '）</div>';
+      ub.style.display = 'block';
+    }
+    // 面板仍打开 + 非 404 → 重新武装轮询，保证轮询链不断。
+    if (!is404
+        && currentDetailId === taskId
+        && $('detail-panel').style.display === 'block') {
+      detailPollTimer = setTimeout(function() {
+        if ($('detail-panel').style.display === 'block' && currentDetailId === taskId) {
+          showTask(taskId);
+        }
+      }, 10000);
+    }
   }
 }
 
@@ -1159,6 +1380,16 @@ loadTasks();
 // v0.2.3 — was 5s in older builds, slowed to 10s; skip when tab is hidden
 // so a background tab doesn't burn MiniMax quota.
 setInterval(function() { if (!document.hidden) loadTasks(); }, 10000);
+
+// v0.2.7 — 标签页从隐藏→可见时立即拉一次，不等下一个 10s 周期。
+document.addEventListener('visibilitychange', function() {
+  if (!document.hidden) loadTasks();
+});
+
+// v0.2.7 — 窗口重新聚焦时清除标题闪烁，恢复原始标题。
+window.addEventListener('focus', function() {
+  document.title = originalTitle;
+});
 
 // -------- API Key dialog --------
 let modelConstraints = null;  // populated by loadConfigStatus()

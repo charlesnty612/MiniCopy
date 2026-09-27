@@ -154,7 +154,20 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             async with MiniMaxClient(cfg) as client:
                 task_id, _content_items, used_context_ir = await _submit_task(client, body)
 
-                extra: dict[str, Any] = {}
+                # Persist billing-relevant fields up-front so the frontend
+                # can estimate cost before the API round-trip completes.
+                # i2v forces ratio=adaptive (server-side); other modes use
+                # the explicit value or fall back to adaptive.
+                effective_ratio = (
+                    "adaptive" if body.mode == "i2v"
+                    else (body.ratio or "adaptive")
+                )
+                extra: dict[str, Any] = {
+                    "model": body.model,
+                    "resolution": body.resolution,
+                    "duration": body.duration,
+                    "ratio": effective_ratio,
+                }
                 if used_context_ir:
                     extra["used_context_ir"] = True
 
@@ -175,10 +188,33 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                     await _download_result(client, cfg, task_id, final_task)
                     rec.status = final_task.get("status", "Success")
                     out_path = str(Path(cfg.videos_dir) / f"{task_id}.mp4")
-                    update_task(task_id, status=rec.status, output_path=out_path)
+                    # Merge server-authoritative billing fields + usage
+                    # into extra so the UI cost column isn't blank on the
+                    # first response. Same merge pattern as
+                    # _refresh_task_from_api — single update_task call.
+                    final_extra = dict(rec.extra or {})
+                    extra_dirty = False
+                    for k in ("model", "resolution", "ratio", "duration"):
+                        if k in final_task and final_task[k] is not None:
+                            if final_extra.get(k) != final_task[k]:
+                                extra_dirty = True
+                            final_extra[k] = final_task[k]
+                    usage = final_task.get("usage")
+                    if usage:
+                        if final_extra.get("usage") != usage:
+                            extra_dirty = True
+                        final_extra["usage"] = usage
+                    update_kwargs: dict[str, Any] = {
+                        "status": rec.status,
+                        "output_path": out_path,
+                    }
+                    if extra_dirty:
+                        update_kwargs["extra"] = final_extra
+                        rec.extra = final_extra
+                    update_task(task_id, **update_kwargs)
                     rec.output_path = out_path
 
-                return {"task_id": task_id, "status": "submitted"}
+                return _record_to_dict(rec)
 
         except TaskError as e:
             if rec is not None:
@@ -712,6 +748,13 @@ async def _refresh_task_from_api(cfg: Config, rec: TaskRecord) -> dict[str, Any]
     Raises whatever the client raises — callers are expected to fall back to
     ``_record_to_dict(rec)`` on failure (graceful degradation: the UI still
     shows *something*).
+
+    v0.2.7+: also adopts the server-authoritative values for
+    ``model`` / ``resolution`` / ``ratio`` / ``duration`` (the V2 query
+    response carries these keys). They overwrite whatever was stored at
+    create time, so a request submitted with ``resolution=768P`` that the
+    API actually processed at ``2K`` (or downgraded on quota) is reflected
+    truthfully to the frontend and persisted in the ledger.
     """
     result: dict[str, Any] = _record_to_dict(rec)
     require_api_key(cfg)
@@ -722,13 +765,30 @@ async def _refresh_task_from_api(cfg: Config, rec: TaskRecord) -> dict[str, Any]
         rec.task_id, status=status, last_query_at=int(time.time() * 1000)
     )
     result["api_status"] = status
+
+    # Collect server-authoritative fields (model/resolution/ratio/duration)
+    # and usage into one merge. storage.update_task does a full-column
+    # overwrite of ``extra``, so we must copy first to preserve
+    # ``used_context_ir`` (and any other create-time keys), then update in
+    # one shot — saving the row once instead of twice.
+    authoritative_keys = ("model", "resolution", "ratio", "duration")
+    merged_extra = dict(rec.extra or {})
+    extra_dirty = False
+    for k in authoritative_keys:
+        if k in api_task and api_task[k] is not None:
+            if merged_extra.get(k) != api_task[k]:
+                extra_dirty = True
+            merged_extra[k] = api_task[k]
+            result[k] = api_task[k]
     # Persist usage (total_seconds etc.) so the UI can show cost.
     usage = api_task.get("usage")
     if usage:
-        extra = dict(rec.extra or {})
-        extra["usage"] = usage
-        update_task(rec.task_id, extra=extra)
+        if merged_extra.get("usage") != usage:
+            extra_dirty = True
+        merged_extra["usage"] = usage
         result["usage"] = usage
+    if extra_dirty:
+        update_task(rec.task_id, extra=merged_extra)
     # Attach content URL if available (content may be a dict {"url": ...}
     # or a list — handled by media._extract_video_url).
     url = _extract_video_url(api_task)
@@ -826,17 +886,37 @@ async def _download_result(
 
 
 def _record_to_dict(rec: TaskRecord) -> dict[str, Any]:
-    """Serialize a TaskRecord for the API."""
-    return {
+    """Serialize a TaskRecord for the API.
+
+    v0.2.7+: also surface the billing-relevant fields stored in
+    ``rec.extra`` (``model``, ``resolution``, ``duration``, ``ratio``) as
+    top-level keys, so the frontend cost estimator can read them without
+    digging into the ``extra`` blob. Fields that are absent (legacy rows
+    pre-v0.2.7 with a thinner blob) are skipped entirely — we never emit
+    ``null`` placeholders that would force every caller to special-case
+    missing values.
+    """
+    out: dict[str, Any] = {
         "task_id": rec.task_id,
         "mode": rec.mode,
         "prompt_excerpt": rec.prompt_excerpt,
         "status": rec.status,
         "submitted_at": rec.submitted_at,
+        # DB column already populated by update_task(..., last_query_at=...)
+        # in _refresh_task_from_api. The frontend "最近查询" row reads
+        # this top-level key (previously always absent, so the row never
+        # rendered). Default 0 means "never queried yet" — a safe value
+        # for fresh rows / legacy entries.
+        "last_query_at": rec.last_query_at,
         "output_path": rec.output_path,
         "error": rec.error,
         "extra": rec.extra,
     }
+    extra = rec.extra or {}
+    for k in ("model", "resolution", "duration", "ratio"):
+        if k in extra:
+            out[k] = extra[k]
+    return out
 
 
 def _detect_key_source(cfg: Config) -> str:

@@ -25,11 +25,12 @@ from minipic.errors import (
     MiniPicError,
     TaskError,
 )
-from minipic.storage import TaskRecord, get_task
+from minipic.storage import TaskRecord, get_task, init_db, insert_task
 from minipic.web import (
     CreateBody,
     _detect_key_source,
     _record_to_dict,
+    _refresh_task_from_api,
     _submit_task,
     _validate_mode,
     create_app,
@@ -262,6 +263,80 @@ class TestApiCreateHappyPath:
         assert resp.status_code == 422
 
 
+# ----------------------------------------------------------------- POST /api/create — billing fields
+class TestApiCreateBillingFields:
+    """Cover the extra / top-level surface of model / resolution / duration / ratio.
+
+    The frontend cost estimator reads ``t.resolution`` directly off the task
+    object, so these keys MUST be top-level in the API response (not buried
+    inside ``extra``). ``_record_to_dict`` promotes them; api_create seeds
+    them so the field is present even before the first server round-trip.
+    """
+
+    def test_t2v_persists_billing_fields_top_level(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        fake = fake_client_factory()
+        fake.create_video_task.return_value = "tid-bill-t2v"
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "a cat", "ratio": "16:9",
+            "resolution": "768P", "duration": 7, "model": "MiniMax-H3-Max",
+        })
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        # All four billing keys appear at the top level of the response.
+        assert data["model"] == "MiniMax-H3-Max"
+        assert data["resolution"] == "768P"
+        assert data["duration"] == 7
+        assert data["ratio"] == "16:9"
+        # They also live inside ``extra`` so the ledger keeps them across
+        # sessions even if the top-level serializer changes.
+        assert data["extra"]["model"] == "MiniMax-H3-Max"
+        assert data["extra"]["resolution"] == "768P"
+        assert data["extra"]["duration"] == 7
+        assert data["extra"]["ratio"] == "16:9"
+
+    def test_i2v_forces_adaptive_ratio_in_extra(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """i2v forces ratio=adaptive server-side; we persist 'adaptive' even
+        when the client doesn't supply a ratio (CreateBody.ratio is None)."""
+        fake = fake_client_factory()
+        fake.create_video_task.return_value = "tid-bill-i2v"
+        resp = web_client.post("/api/create", json={
+            "mode": "i2v", "prompt": "x",
+            "ref_images": [{"path": "https://cdn/first.jpg",
+                             "role": "first_frame"}],
+            # Note: NO ratio field — i2v must default to adaptive.
+        })
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["ratio"] == "adaptive"
+        assert data["extra"]["ratio"] == "adaptive"
+
+    def test_t2v_with_ir_rewrite_keeps_used_context_ir_key(
+        self, web_client: TestClient, fake_client_factory
+    ) -> None:
+        """Regression guard: adding the 4 billing fields to extra must not
+        evict the existing ``used_context_ir`` flag set by _submit_task.
+        Storage's update_task does a full-column overwrite, so the caller is
+        responsible for merging — this test pins that contract.
+        """
+        fake = fake_client_factory()
+        # Force the IR rewrite branch so used_context_ir=True lands in extra.
+        fake.fetch_context_ir_prompt.return_value = "rewritten prompt"
+        fake.create_video_task.return_value = "tid-bill-ir"
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "x", "ratio": "16:9", "duration": 5,
+        })
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["extra"]["used_context_ir"] is True
+        # All four billing keys still co-exist with the IR flag.
+        for k in ("model", "resolution", "duration", "ratio"):
+            assert k in data["extra"], f"missing billing key {k} in extra"
+
+
 # --------------------------------------------------------------------------- POST /api/create — error paths
 class TestApiCreateErrors:
     def test_task_error_returns_400(
@@ -319,6 +394,42 @@ class TestApiCreateWaitFlow:
         result = Path(web_cfg.videos_dir) / "tid-wait-1.mp4"
         assert result.is_file()
         assert result.read_bytes() == b"fake-mp4"
+
+    def test_wait_true_persists_usage_and_billing_in_extra(
+        self, web_client: TestClient, web_cfg: Config, fake_client_factory
+    ) -> None:
+        """v0.2.7+: wait=True must persist the server-authoritative usage
+        and billing fields into the ledger in the same call as status /
+        output_path, so the UI cost column isn't blank on the first
+        response. The poll_until_done result feeds the same merge logic
+        as _refresh_task_from_api.
+        """
+        fake = fake_client_factory()
+        fake.create_video_task.return_value = "tid-wait-usage"
+        fake.query_video_task.return_value = {
+            "status": "Success",
+            "model": "MiniMax-H3",
+            "resolution": "2K",
+            "ratio": "16:9",
+            "duration": 5,
+            "usage": {"total_seconds": 5, "prompt_tokens": 100},
+            "content": [{"url": "https://cdn/v.mp4"}],
+        }
+
+        resp = web_client.post("/api/create", json={
+            "mode": "t2v", "prompt": "x", "ratio": "16:9", "wait": True,
+            "resolution": "768P",  # server overrides to 2K
+        })
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        # Usage surfaces in the API response (both top-level & extra).
+        assert data["extra"]["usage"] == {"total_seconds": 5, "prompt_tokens": 100}
+        # Server-authoritative resolution overrode the create value.
+        assert data["extra"]["resolution"] == "2K"
+        assert data["resolution"] == "2K"
+        # used_context_ir (False here) is still absent — the merge doesn't
+        # invent keys that weren't there before.
+        assert "used_context_ir" not in data["extra"]
 
 
 # --------------------------------------------------------------------------- GET /api/tasks
@@ -1197,6 +1308,332 @@ class TestRecordToDict:
         assert d["output_path"] is None
         assert d["error"] is None
         assert d["extra"] == {}
+
+    def test_legacy_record_without_billing_keys_emits_no_top_level_keys(self) -> None:
+        """Pre-v0.2.7 rows have a thinner extra blob (no model/resolution/
+        duration/ratio). The serializer must NOT emit ``None`` placeholders
+        for those keys — the frontend cost estimator is supposed to fall
+        back gracefully when they're absent.
+        """
+        # extra={} is the historical default (TaskRecord default).
+        rec = TaskRecord(task_id="legacy", mode="t2v", prompt_excerpt="p")
+        d = _record_to_dict(rec)
+        for k in ("model", "resolution", "duration", "ratio"):
+            assert k not in d, f"legacy record should not emit {k}"
+
+    def test_partial_billing_keys_only_surface_what_is_present(self) -> None:
+        """If only some of the billing keys are present (e.g. a row written
+        mid-migration), only those appear at the top level."""
+        rec = TaskRecord(
+            task_id="mid", mode="t2v", prompt_excerpt="p",
+            extra={"model": "MiniMax-H3", "resolution": "768P"},
+        )
+        d = _record_to_dict(rec)
+        assert d["model"] == "MiniMax-H3"
+        assert d["resolution"] == "768P"
+        # The missing keys stay missing (not None).
+        assert "duration" not in d
+        assert "ratio" not in d
+
+    def test_full_billing_keys_all_surface(self) -> None:
+        rec = TaskRecord(
+            task_id="full", mode="t2v", prompt_excerpt="p",
+            extra={
+                "model": "MiniMax-H3-Max",
+                "resolution": "2K",
+                "duration": 10,
+                "ratio": "16:9",
+            },
+        )
+        d = _record_to_dict(rec)
+        assert d["model"] == "MiniMax-H3-Max"
+        assert d["resolution"] == "2K"
+        assert d["duration"] == 10
+        assert d["ratio"] == "16:9"
+
+    def test_all_standard_fields_are_emitted(self) -> None:
+        """Contract guard: every standard TaskRecord column must surface as
+        a top-level key in the API response. The frontend reads each one
+        independently (status badge, "最近查询" row, prompt excerpt, etc.)
+        — a silent field drop here would break the UI without raising an
+        error. If a new column is added to TaskRecord, this test pins the
+        contract by failing until the serializer learns about it.
+        """
+        rec = TaskRecord(
+            task_id="contract-tid",
+            mode="r2v",
+            prompt_excerpt="a cat on a bike",
+            status="submitted",
+            submitted_at=1_700_000_000_000,
+            last_query_at=1_700_000_999_000,
+            output_path="/vids/contract-tid.mp4",
+            error=None,
+            extra={"model": "MiniMax-H3", "resolution": "768P"},
+        )
+        d = _record_to_dict(rec)
+        # Every standard key must be present, with the exact value from rec.
+        expected: dict[str, Any] = {
+            "task_id": "contract-tid",
+            "mode": "r2v",
+            "prompt_excerpt": "a cat on a bike",
+            "status": "submitted",
+            "submitted_at": 1_700_000_000_000,
+            "last_query_at": 1_700_000_999_000,
+            "output_path": "/vids/contract-tid.mp4",
+            "error": None,
+            "extra": {"model": "MiniMax-H3", "resolution": "768P"},
+        }
+        for k, v in expected.items():
+            assert k in d, f"missing standard key {k!r} in _record_to_dict output"
+            assert d[k] == v, f"{k!r}: expected {v!r}, got {d[k]!r}"
+        # The conditional billing keys are also surfaced (from extra).
+        assert d["model"] == "MiniMax-H3"
+        assert d["resolution"] == "768P"
+
+
+# --------------------------------------------- _refresh_task_from_api — server-authoritative
+class TestRefreshOverridesBillingFields:
+    """The V2 query response carries model/resolution/ratio/duration. When
+    those differ from what we sent (e.g. server downgraded resolution on
+    quota), the refreshed record must reflect the server-authoritative
+    value both in ``extra`` and as top-level keys on the API response.
+    """
+
+    @pytest.mark.asyncio
+    async def test_api_resolution_overrides_create_value(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Create with 768P, server returns 2K → persisted extra & response
+        both show 2K, and the original 768P is overwritten."""
+        # Isolate the DB so update_task writes go to a tmp file.
+        target = tmp_path / "tasks.db"
+        monkeypatch.setattr("minipic.storage.db_path", lambda: target)
+        init_db()
+
+        cfg = Config(api_key="k")
+        # Seed a record as if api_create ran: resolution=768P, model=H3.
+        rec = TaskRecord(
+            task_id="tid-refresh", mode="t2v", prompt_excerpt="x",
+            status="submitted",
+            extra={
+                "model": "MiniMax-H3",
+                "resolution": "768P",
+                "duration": 5,
+                "ratio": "16:9",
+                "used_context_ir": True,
+            },
+        )
+        insert_task(rec)
+
+        # Stub the client so the query returns a *different* resolution.
+        class _FakeClient:
+            async def __aenter__(self) -> _FakeClient:
+                return self
+            async def __aexit__(self, *exc: Any) -> None:
+                return None
+            async def query_video_task(self, task_id: str) -> dict[str, Any]:
+                # Server-authoritative — different from what we sent.
+                return {
+                    "status": "Success",
+                    "model": "MiniMax-H3",
+                    "resolution": "2K",   # upgraded from 768P
+                    "ratio": "16:9",
+                    "duration": 5,
+                    "content": [{"url": "https://cdn/v.mp4"}],
+                }
+        monkeypatch.setattr("minipic.web.MiniMaxClient", lambda cfg: _FakeClient())
+
+        result = await _refresh_task_from_api(cfg, rec)
+
+        # Top-level keys on the API response reflect server values.
+        assert result["resolution"] == "2K"
+        assert result["model"] == "MiniMax-H3"
+        assert result["ratio"] == "16:9"
+        assert result["duration"] == 5
+
+        # The ledger row was overwritten in extra too.
+        persisted = get_task("tid-refresh")
+        assert persisted is not None
+        assert persisted.extra["resolution"] == "2K"
+        # used_context_ir must survive the merge (regression guard).
+        assert persisted.extra["used_context_ir"] is True
+
+    @pytest.mark.asyncio
+    async def test_api_response_missing_keys_does_not_overwrite(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """If the API response omits one of the billing keys (older API
+        shape), we keep the create-time value instead of clobbering it
+        with None."""
+        target = tmp_path / "tasks.db"
+        monkeypatch.setattr("minipic.storage.db_path", lambda: target)
+        init_db()
+
+        cfg = Config(api_key="k")
+        rec = TaskRecord(
+            task_id="tid-partial", mode="t2v", prompt_excerpt="x",
+            status="submitted",
+            extra={"model": "MiniMax-H3", "resolution": "768P",
+                   "duration": 5, "ratio": "16:9"},
+        )
+        insert_task(rec)
+
+        class _FakeClient:
+            async def __aenter__(self) -> _FakeClient:
+                return self
+            async def __aexit__(self, *exc: Any) -> None:
+                return None
+            async def query_video_task(self, task_id: str) -> dict[str, Any]:
+                # Only resolution is present in the response.
+                return {
+                    "status": "Success",
+                    "resolution": "2K",
+                    "content": [{"url": "https://cdn/v.mp4"}],
+                }
+        monkeypatch.setattr("minipic.web.MiniMaxClient", lambda cfg: _FakeClient())
+
+        result = await _refresh_task_from_api(cfg, rec)
+        # Only resolution was overwritten; the others stay at create-time.
+        assert result["resolution"] == "2K"
+        assert result["model"] == "MiniMax-H3"
+        assert result["ratio"] == "16:9"
+        assert result["duration"] == 5
+
+        persisted = get_task("tid-partial")
+        assert persisted is not None
+        assert persisted.extra["resolution"] == "2K"
+        assert persisted.extra["model"] == "MiniMax-H3"
+        assert persisted.extra["ratio"] == "16:9"
+        assert persisted.extra["duration"] == 5
+
+    @pytest.mark.asyncio
+    async def test_persists_extra_in_a_single_write(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """v0.2.7+ refactor: when both authoritative billing fields and
+        usage are present in the API response, ``update_task(extra=...)``
+        is called **exactly once** for the extra column. The earlier
+        implementation had two separate ``if`` blocks each rebuilding
+        ``merged_extra`` and calling ``update_task`` independently — that
+        doubled the write load and risked races between the two writes.
+        """
+        from minipic.storage import db_path
+        target = tmp_path / "tasks.db"
+        monkeypatch.setattr("minipic.storage.db_path", lambda: target)
+        init_db()
+
+        cfg = Config(api_key="k")
+
+        rec = TaskRecord(
+            task_id="tid-once", mode="t2v", prompt_excerpt="x",
+            status="submitted",
+            extra={"model": "MiniMax-H3", "resolution": "768P",
+                   "duration": 5, "ratio": "16:9"},
+        )
+        insert_task(rec)
+
+        # Count update_task calls so we can assert the single-write contract.
+        from minipic import web as web_mod
+        original_update_task = web_mod.update_task
+        call_args: list[dict[str, Any]] = []
+
+        def tracking_update_task(task_id: str, **kwargs: Any) -> Any:
+            call_args.append({"task_id": task_id, **kwargs})
+            return original_update_task(task_id, **kwargs)
+
+        monkeypatch.setattr(web_mod, "update_task", tracking_update_task)
+
+        class _FakeClient:
+            async def __aenter__(self) -> _FakeClient:
+                return self
+            async def __aexit__(self, *exc: Any) -> None:
+                return None
+            async def query_video_task(self, task_id: str) -> dict[str, Any]:
+                # Both authoritative fields AND usage are present.
+                return {
+                    "status": "Success",
+                    "model": "MiniMax-H3",
+                    "resolution": "2K",
+                    "ratio": "16:9",
+                    "duration": 5,
+                    "usage": {"total_seconds": 5},
+                    "content": [{"url": "https://cdn/v.mp4"}],
+                }
+        monkeypatch.setattr("minipic.web.MiniMaxClient", lambda cfg: _FakeClient())
+
+        await _refresh_task_from_api(cfg, rec)
+
+        # Exactly one update_task call carried an ``extra`` kwarg, even
+        # though both authoritative fields and usage had to be merged.
+        extra_calls = [c for c in call_args if "extra" in c]
+        assert len(extra_calls) == 1, (
+            f"expected exactly one update_task(extra=...) call, got "
+            f"{len(extra_calls)}: {extra_calls}"
+        )
+        merged = extra_calls[0]["extra"]
+        # All five keys present in the single merged write.
+        assert merged["resolution"] == "2K"
+        assert merged["model"] == "MiniMax-H3"
+        assert merged["ratio"] == "16:9"
+        assert merged["duration"] == 5
+        assert merged["usage"] == {"total_seconds": 5}
+
+    @pytest.mark.asyncio
+    async def test_skips_extra_write_when_nothing_changed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """If the API response carries neither authoritative overrides
+        nor usage, we must NOT issue a no-op ``update_task(extra=...)``
+        write — the merge came back equal to ``rec.extra``.
+        """
+        from minipic.storage import db_path
+        target = tmp_path / "tasks.db"
+        monkeypatch.setattr("minipic.storage.db_path", lambda: target)
+        init_db()
+
+        cfg = Config(api_key="k")
+        rec = TaskRecord(
+            task_id="tid-noop", mode="t2v", prompt_excerpt="x",
+            status="submitted",
+            extra={"model": "MiniMax-H3", "resolution": "768P",
+                   "duration": 5, "ratio": "16:9"},
+        )
+        insert_task(rec)
+
+        from minipic import web as web_mod
+        original_update_task = web_mod.update_task
+        call_args: list[dict[str, Any]] = []
+
+        def tracking_update_task(task_id: str, **kwargs: Any) -> Any:
+            call_args.append({"task_id": task_id, **kwargs})
+            return original_update_task(task_id, **kwargs)
+
+        monkeypatch.setattr(web_mod, "update_task", tracking_update_task)
+
+        class _FakeClient:
+            async def __aenter__(self) -> _FakeClient:
+                return self
+            async def __aexit__(self, *exc: Any) -> None:
+                return None
+            async def query_video_task(self, task_id: str) -> dict[str, Any]:
+                # Same values we stored at create time — no diff.
+                return {
+                    "status": "Success",
+                    "model": "MiniMax-H3",
+                    "resolution": "768P",
+                    "ratio": "16:9",
+                    "duration": 5,
+                    "content": [{"url": "https://cdn/v.mp4"}],
+                }
+        monkeypatch.setattr("minipic.web.MiniMaxClient", lambda cfg: _FakeClient())
+
+        await _refresh_task_from_api(cfg, rec)
+
+        extra_calls = [c for c in call_args if "extra" in c]
+        assert extra_calls == [], (
+            f"expected zero update_task(extra=...) writes when nothing "
+            f"changed, got {extra_calls}"
+        )
 
 
 # --------------------------------------------------------------------------- GET /api/config + POST /api/config
