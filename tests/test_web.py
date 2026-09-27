@@ -698,6 +698,53 @@ class TestValidateMode:
         with pytest.raises(HTTPException):
             _validate_mode(self._body(mode="r2v"))
 
+    def test_r2v_explicit_ratio_9_16_accepted(self) -> None:
+        """r2v accepts an explicit non-adaptive ratio (no longer just None)."""
+        # Build a minimal valid r2v body — one reference image is enough.
+        body = CreateBody(
+            mode="r2v",
+            prompt="x",
+            ratio="9:16",
+            ref_images=[{"path": "https://cdn/a.jpg", "role": "reference_image"}],
+        )
+        # Should not raise.
+        _validate_mode(body)
+
+    def test_ratio_invalid_value_rejected_at_pydantic(self) -> None:
+        """The pydantic Field pattern rejects ratios outside the 7-value enum
+        (adaptive|21:9|16:9|4:3|1:1|3:4|9:16) with HTTP 422 at the boundary,
+        not 400 deep in the client."""
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            CreateBody(mode="t2v", prompt="x", ratio="16:10")  # not in enum
+        with pytest.raises(ValidationError):
+            CreateBody(mode="r2v", prompt="x", ratio="ultrawide",
+                       ref_images=[{"path": "/a.jpg"}])
+
+    def test_prompt_expansion_mode_h3_rejected(self) -> None:
+        """prompt_expansion_mode is MiniMax-H3-Max only — H3 raises 400."""
+        from fastapi import HTTPException
+        body = self._body(prompt_expansion_mode="balanced")  # default model=H3
+        with pytest.raises(HTTPException) as ei:
+            _validate_mode(body)
+        assert ei.value.status_code == 400
+        assert "MiniMax-H3-Max" in ei.value.detail
+
+    def test_prompt_expansion_mode_h3_max_accepted(self) -> None:
+        """H3-Max + prompt_expansion_mode passes validation (no refs needed
+        because we're on the t2v default branch — just verifying the model
+        gate doesn't false-trigger)."""
+        body = CreateBody(
+            mode="t2v", prompt="x", ratio="16:9",
+            model="MiniMax-H3-Max",
+            prompt_expansion_mode="balanced",
+        )
+        _validate_mode(body)  # should not raise
+
+    def test_aigc_watermark_default_false(self) -> None:
+        body = self._body()
+        assert body.aigc_watermark is False
+
 
 # --------------------------------------------------------------------------- _submit_task
 class TestSubmitTask:
@@ -912,6 +959,52 @@ class TestSubmitTask:
         audios = [c for c in content if c.get("type") == "audio_url"]
         assert len(audios) == 1
         assert audios[0]["duration"] == 8.0
+
+    @pytest.mark.asyncio
+    async def test_aigc_watermark_passed_through(self) -> None:
+        """aigc_watermark from CreateBody flows into create_video_task kwargs."""
+        body = CreateBody(
+            mode="t2v", prompt="x", ratio="16:9", duration=5,
+            aigc_watermark=True,
+        )
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-wm")
+
+        await _submit_task(client, body)
+        kwargs = client.create_video_task.await_args.kwargs
+        assert kwargs["aigc_watermark"] is True
+
+    @pytest.mark.asyncio
+    async def test_prompt_expansion_mode_passed_through(self) -> None:
+        """prompt_expansion_mode from CreateBody flows into create_video_task kwargs."""
+        body = CreateBody(
+            mode="r2v", prompt="x",
+            ratio="9:16",
+            model="MiniMax-H3-Max",
+            ref_images=[{"path": "https://cdn/a.jpg", "role": "reference_image"}],
+            prompt_expansion_mode="balanced",
+        )
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-pm")
+
+        await _submit_task(client, body)
+        kwargs = client.create_video_task.await_args.kwargs
+        assert kwargs["prompt_expansion_mode"] == "balanced"
+        assert kwargs["model"] == "MiniMax-H3-Max"
+
+    @pytest.mark.asyncio
+    async def test_aigc_watermark_default_false_is_forwarded(self) -> None:
+        """When aigc_watermark isn't set (default False), it's still forwarded
+        as False — the client layer treats False as 'send the field' per the
+        V2 schema."""
+        body = CreateBody(mode="t2v", prompt="x", ratio="16:9", duration=5)
+        client = MagicMock()
+        client.create_video_task = AsyncMock(return_value="tid-default")
+
+        await _submit_task(client, body)
+        kwargs = client.create_video_task.await_args.kwargs
+        assert kwargs["aigc_watermark"] is False
+        assert kwargs["prompt_expansion_mode"] is None
 
 
 # --------------------------------------------------------------------------- _submit_task — Context-IR wiring (Bug 2 fix)

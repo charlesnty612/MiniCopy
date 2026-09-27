@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -131,8 +132,20 @@ class MiniMaxClient:
         duration: int,
         resolution: str = "768P",
         ratio: str = "adaptive",
+        aigc_watermark: bool | None = None,
+        prompt_expansion_mode: str | None = None,
     ) -> str:
-        """Submit a generation task. Returns task_id."""
+        """Submit a generation task. Returns task_id.
+
+        Optional pass-through fields aligned with the V2 API schema:
+          - ``aigc_watermark`` (bool): AIGC watermark toggle (both models).
+          - ``prompt_expansion_mode`` (str ∈ {disabled, balanced, quality}):
+            only MiniMax-H3-Max supports it; sent under ``payload["extra"]``.
+
+        Passing ``None`` (default) means "do not send the field". Per the
+        official docs the API rejects empty strings / booleans / undeclared
+        fields, so we omit entirely instead of sending nulls.
+        """
         if model not in ("MiniMax-H3", "MiniMax-H3-Max"):
             raise ConfigError(
                 f"unsupported model: {model!r} (supported: MiniMax-H3, MiniMax-H3-Max)"
@@ -145,6 +158,27 @@ class MiniMaxClient:
             "resolution": resolution,
             "ratio": ratio,
         }
+        if aigc_watermark is not None:
+            payload["aigc_watermark"] = bool(aigc_watermark)
+        if prompt_expansion_mode is not None:
+            # Validation: only H3-Max supports prompt_expansion_mode, and the
+            # value must be one of the documented enum entries. We check here
+            # (not in the web/CLI layer) so that every caller — web, CLI, and
+            # future surfaces — gets the same guard before hitting the API.
+            if model != "MiniMax-H3-Max":
+                raise ConfigError(
+                    f"prompt_expansion_mode is only supported by MiniMax-H3-Max "
+                    f"(got model={model!r})"
+                )
+            if prompt_expansion_mode not in {"disabled", "balanced", "quality"}:
+                raise ConfigError(
+                    f"invalid prompt_expansion_mode: {prompt_expansion_mode!r} "
+                    f"(allowed: disabled, balanced, quality)"
+                )
+            # Use setdefault so future extra-* fields (e.g. extra.safety_tier,
+            # extra.seed) can extend the dict without overwriting peers that
+            # may be added by upstream code paths.
+            payload.setdefault("extra", {})["prompt_expansion_mode"] = prompt_expansion_mode
         resp = await self._request_with_retry("POST", EP_CREATE_VIDEO, json_body=payload)
         body = resp.json()
         task_id = body.get("task_id")
@@ -329,6 +363,17 @@ class MiniMaxClient:
                 or resp.text[:200]
             )
             request_id = err_body.get("request_id") or err_body.get("id")
+
+            # Fallback: the official V2 error body has no numeric ``code``
+            # field — the error code lives only in the trailing ``(NNNN)`` of
+            # the message string (e.g. ``"rate limit, please retry later (1002)"``).
+            # Without this, RETRYABLE_CODES (1000/1001/1002) and the per-code
+            # exception map never fire — every error silently falls through to
+            # the generic MiniPicError. Extract from msg when code is still 0.
+            if not code and isinstance(msg, str):
+                m = re.search(r"\((\d{3,4})\)\s*$", msg)
+                if m:
+                    code = int(m.group(1))
 
             if code in RETRYABLE_CODES and attempt < max_attempts:
                 ra = resp.headers.get("Retry-After")

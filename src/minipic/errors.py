@@ -1,10 +1,21 @@
 """Error code → exception mapping for the MiniMax public API.
 
-Source: https://platform.minimaxi.com/docs/api-reference (verified 2026-09-01).
+Source: https://platform.minimaxi.com/docs/api-reference (verified 2026-09-27).
 Retry policy:
   - Retry: 1000 (server), 1001 (timeout), 1002 (rate limit)
   - Do NOT retry: 1004 / 2049 (auth), 1008 (balance), 1026 (safety),
                    1039 (token limit), 2013 (invalid params), 2056 (Token Plan window)
+
+Exception class assignment (via `_CODE_TO_EXC`, fired after the retry budget
+is exhausted in `client._request_with_retry`):
+  - 1000 → ServerError     (upstream internal error)
+  - 1001 → ServerError     (upstream timeout — no dedicated class; reuses 1000)
+  - 1002 → RateLimitError  (rate limit; callers can ``except RateLimitError``)
+  - 1004 / 2049 → AuthError
+  - 1008 / 2056 → BalanceError
+  - 1026 → SafetyError
+  - 1039 / 2013 → InvalidParamsError
+  - Any other code → generic MiniPicError (still carries ``[code] message``).
 """
 
 from __future__ import annotations
@@ -72,6 +83,12 @@ class ApiErrorPayload:
 
 
 _CODE_TO_EXC = {
+    1000: ServerError,   # upstream internal error (retryable)
+    1001: ServerError,   # upstream timeout — no dedicated TimeoutError class;
+                       # the retry loop in client.py already retries on
+                       # RETRYABLE_CODES, so after exhaustion the caller
+                       # gets ServerError, which is consistent with 1000.
+    1002: RateLimitError,  # rate limit (retryable)
     1004: AuthError,
     1008: BalanceError,
     1026: SafetyError,

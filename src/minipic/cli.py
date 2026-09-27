@@ -253,18 +253,34 @@ def create_group() -> None:
     default=False,
     help="Disable H3-Context-IR prompt rewrite (H3 only; H3-Max auto-skips).",
 )
+@click.option(
+    "--aigc-watermark/--no-aigc-watermark",
+    default=False,
+    help="Embed an AIGC watermark on the generated video (default: off).",
+)
+@click.option(
+    "--prompt-expansion-mode",
+    type=click.Choice(["disabled", "balanced", "quality"], case_sensitive=False),
+    default=None,
+    help="Extra prompt-expansion mode (MiniMax-H3-Max only; default: server-side).",
+)
 def create_t2v(
     prompt: str,
-    duration: Optional[int],
+    duration: int | None,
     ratio: str,
     resolution: str,
     model: str,
     wait: bool,
     no_context_ir: bool,
+    aigc_watermark: bool,
+    prompt_expansion_mode: str | None,
 ) -> None:
     """Text-to-video: pure text prompt → video."""
     if ratio == "adaptive":
         _print("[red]--ratio may not be 'adaptive' for t2v.[/red]")
+        raise SystemExit(1)
+    if prompt_expansion_mode is not None and model != "MiniMax-H3-Max":
+        _print("[red]--prompt-expansion-mode 仅 MiniMax-H3-Max 支持[/red]")
         raise SystemExit(1)
 
     cfg = load_config()
@@ -296,6 +312,8 @@ def create_t2v(
                 duration=duration_val,
                 resolution=resolution,
                 ratio=ratio,
+                aigc_watermark=aigc_watermark,
+                prompt_expansion_mode=prompt_expansion_mode,
             )
             _print(f"[green]Task submitted: {task_id}[/green]")
             rec = TaskRecord(
@@ -353,17 +371,34 @@ def create_t2v(
     default=False,
     help="Disable H3-Context-IR prompt rewrite (H3 only; H3-Max auto-skips).",
 )
+@click.option(
+    "--aigc-watermark/--no-aigc-watermark",
+    default=False,
+    help="Embed an AIGC watermark on the generated video (default: off).",
+)
+@click.option(
+    "--prompt-expansion-mode",
+    type=click.Choice(["disabled", "balanced", "quality"], case_sensitive=False),
+    default=None,
+    help="Extra prompt-expansion mode (MiniMax-H3-Max only; default: server-side).",
+)
 def create_i2v(
     prompt: str,
     ref_image: str,
     ref_image_role: str,
-    duration: Optional[int],
+    duration: int | None,
     resolution: str,
     model: str,
     wait: bool,
     no_context_ir: bool,
+    aigc_watermark: bool,
+    prompt_expansion_mode: str | None,
 ) -> None:
     """Image-to-video: first-frame image + text prompt → video."""
+    if prompt_expansion_mode is not None and model != "MiniMax-H3-Max":
+        _print("[red]--prompt-expansion-mode 仅 MiniMax-H3-Max 支持[/red]")
+        raise SystemExit(1)
+
     cfg = load_config()
     require_api_key(cfg)
 
@@ -387,6 +422,9 @@ def create_i2v(
                 ref_images=[{"path": ref_image, "role": ref_image_role}],
             )
             # i2v forces ratio=adaptive for both Context-IR and the real task.
+            # Context-IR has no extra.prompt_expansion_mode / aigc_watermark
+            # fields, so we never forward them to it — they only land on the
+            # create_video_task call below.
             if not no_context_ir and await _maybe_apply_context_ir(
                 client, model=model, content=content,
                 duration=duration_val, ratio="adaptive",
@@ -398,6 +436,8 @@ def create_i2v(
                 duration=duration_val,
                 resolution=resolution,
                 ratio="adaptive",
+                aigc_watermark=aigc_watermark,
+                prompt_expansion_mode=prompt_expansion_mode,
             )
             _print(f"[green]Task submitted: {task_id}[/green]")
             rec = TaskRecord(
@@ -468,19 +508,36 @@ def create_i2v(
     default=False,
     help="Disable H3-Context-IR prompt rewrite (H3 only; H3-Max auto-skips).",
 )
+@click.option(
+    "--aigc-watermark/--no-aigc-watermark",
+    default=False,
+    help="Embed an AIGC watermark on the generated video (default: off).",
+)
+@click.option(
+    "--prompt-expansion-mode",
+    type=click.Choice(["disabled", "balanced", "quality"], case_sensitive=False),
+    default=None,
+    help="Extra prompt-expansion mode (MiniMax-H3-Max only; default: server-side).",
+)
 def create_r2v(
     prompt: str,
     ref_image: tuple[str, ...],
     ref_video: tuple[str, ...],
     ref_audio: tuple[str, ...],
     ratio: str,
-    duration: Optional[int],
+    duration: int | None,
     resolution: str,
     model: str,
     wait: bool,
     no_context_ir: bool,
+    aigc_watermark: bool,
+    prompt_expansion_mode: str | None,
 ) -> None:
     """Reference video generation: text + multimodal references → video."""
+    if prompt_expansion_mode is not None and model != "MiniMax-H3-Max":
+        _print("[red]--prompt-expansion-mode 仅 MiniMax-H3-Max 支持[/red]")
+        raise SystemExit(1)
+
     cfg = load_config()
     require_api_key(cfg)
 
@@ -535,6 +592,8 @@ def create_r2v(
                 duration=duration_val,
                 resolution=resolution,
                 ratio=ratio,
+                aigc_watermark=aigc_watermark,
+                prompt_expansion_mode=prompt_expansion_mode,
             )
             _print(f"[green]Task submitted: {task_id}[/green]")
             rec = TaskRecord(

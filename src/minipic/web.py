@@ -510,13 +510,29 @@ class CreateBody(BaseModel):
     model: Annotated[str, Field(pattern=r"^(MiniMax-H3|MiniMax-H3-Max)$")] = "MiniMax-H3"
     prompt: str
     duration: int = Field(ge=4, le=15, default=10)
-    ratio: Optional[str] = None  # null means "not supplied"
+    # V2 API ratio enum: adaptive|21:9|16:9|4:3|1:1|3:4|9:16.
+    # null means "not supplied" (i2v forces adaptive server-side; r2v/t2v
+    # callers should normally set it). Adaptive is included because the
+    # frontend sometimes sends it for r2v (r2v's default on the server).
+    ratio: Annotated[
+        str | None,
+        Field(default=None, pattern=r"^(adaptive|21:9|16:9|4:3|1:1|3:4|9:16)$"),
+    ] = None
     resolution: Annotated[str, Field(pattern=r"^(480P|768P|2K)$")] = "768P"
     ref_images: list[dict[str, Any]] = Field(default_factory=list)
     ref_videos: list[dict[str, Any]] = Field(default_factory=list)
     ref_audios: list[dict[str, Any]] = Field(default_factory=list)
     wait: bool = False
     use_context_ir: bool = True
+    # V2 optional pass-through fields. The frontend sends aigc_watermark on
+    # every request and prompt_expansion_mode only when the user picks one.
+    # We validate prompt_expansion_mode here too so a malformed value fails
+    # with HTTP 422 at the boundary instead of 400 from the client layer.
+    aigc_watermark: bool = False
+    prompt_expansion_mode: Annotated[
+        str | None,
+        Field(default=None, pattern=r"^(disabled|balanced|quality)$"),
+    ] = None
 
 
 class ConfigBody(BaseModel):
@@ -594,7 +610,7 @@ def _validate_mode(body: CreateBody) -> None:
         if ratio and ratio != "adaptive":
             raise HTTPException(
                 status_code=400,
-                detail="i2v mode forces ratio=adaptive; do not supply a ratio",
+                detail="i2v 模式比例由首/尾帧图片决定（服务端强制 adaptive），请勿传 ratio",
             )
         n_imgs = len(body.ref_images)
         if n_imgs not in (1, 2):
@@ -679,6 +695,14 @@ def _validate_mode(body: CreateBody) -> None:
         )
     except ConfigError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # V2 extra.prompt_expansion_mode is only supported by MiniMax-H3-Max.
+    # Reject early with 400 (rather than letting the API reject with 2013).
+    if body.prompt_expansion_mode is not None and body.model != "MiniMax-H3-Max":
+        raise HTTPException(
+            status_code=400,
+            detail="prompt_expansion_mode 仅 MiniMax-H3-Max 支持",
+        )
 
 
 async def _refresh_task_from_api(cfg: Config, rec: TaskRecord) -> dict[str, Any]:
@@ -776,6 +800,8 @@ async def _submit_task(client: MiniMaxClient, body: CreateBody) -> tuple[str, li
         duration=body.duration,
         resolution=body.resolution,
         ratio=ratio,
+        aigc_watermark=body.aigc_watermark,
+        prompt_expansion_mode=body.prompt_expansion_mode,
     )
     return task_id, content, used_context_ir
 

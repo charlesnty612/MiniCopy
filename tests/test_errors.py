@@ -11,6 +11,7 @@ from minipic.errors import (
     InvalidParamsError,
     MiniPicError,
     RETRYABLE_CODES,
+    RateLimitError,
     SafetyError,
     ServerError,
     TERMINAL_CODES,
@@ -99,8 +100,8 @@ class TestRaiseForCodeTerminal:
             raise_for_code(ApiErrorPayload(code=1004, message="no auth"))
 
 
-# --------------------------------------------------------------------------- raise_for_code: unknown / retryable
-class TestRaiseForCodeUnknown:
+# ----------------------------------------------------------------- raise_for_code: retryable
+class TestRaiseForCodeMapping:
     def test_unknown_code_raises_base(self) -> None:
         payload = ApiErrorPayload(code=99999, message="weird")
         with pytest.raises(MiniPicError) as ei:
@@ -108,17 +109,57 @@ class TestRaiseForCodeUnknown:
         # Should NOT be a more specific subclass
         assert type(ei.value) is MiniPicError
 
-    @pytest.mark.parametrize("code", [1000, 1001, 1002])
-    def test_retryable_codes_do_not_raise_via_raise_for_code(self, code: int) -> None:
-        """Retryable codes (1000/1001/1002) are not in the terminal map.
-
-        The client is responsible for retrying them; raise_for_code itself
-        should let them bubble up only if the retry loop runs out.
+    @pytest.mark.parametrize(
+        "code,expected_cls",
+        [
+            (1000, ServerError),     # upstream internal error
+            (1001, ServerError),     # upstream timeout (no dedicated class —
+                                     # exhaustion of RETRYABLE_CODES retries
+                                     # surfaces as ServerError, consistent with 1000)
+            (1002, RateLimitError),  # rate limit (retryable)
+        ],
+    )
+    def test_retryable_codes_map_to_dedicated_subclass(
+        self, code: int, expected_cls: type[MiniPicError]
+    ) -> None:
+        """v0.2.6+: retryable codes (1000/1001/1002) now map to dedicated
+        subclasses so the caller can ``except RateLimitError`` instead of
+        only ``except MiniPicError``. The retry loop in client.py still
+        owns the retry-then-give-up decision; raise_for_code only fires
+        after that budget is exhausted.
         """
-        # Since they're not in the terminal map, calling raise_for_code on a
-        # retryable code will fall through to the generic MiniPicError path.
-        with pytest.raises(MiniPicError):
-            raise_for_code(ApiErrorPayload(code=code, message="transient"))
+        payload = ApiErrorPayload(code=code, message=f"err {code}")
+        with pytest.raises(expected_cls) as ei:
+            raise_for_code(payload)
+        # Every subclass must still be catchable as the base MiniPicError.
+        assert isinstance(ei.value, MiniPicError)
+
+    def test_rate_limit_error_includes_code_in_message(self) -> None:
+        """The mapped message format must surface the extracted code so the
+        caller can grep it (mirrors the SafetyError / AuthError tests above)."""
+        payload = ApiErrorPayload(code=1002, message="rate limit, please retry later")
+        with pytest.raises(RateLimitError) as ei:
+            raise_for_code(payload)
+        assert "[1002]" in str(ei.value)
+        assert "rate limit, please retry later" in str(ei.value)
+
+    def test_server_error_for_1000_and_1001_have_distinct_messages(self) -> None:
+        """Both 1000 and 1001 funnel into ServerError; the message must still
+        carry the code so the two root causes don't collapse indistinguishably.
+        """
+        with pytest.raises(ServerError) as ei1000:
+            raise_for_code(ApiErrorPayload(code=1000, message="internal"))
+        with pytest.raises(ServerError) as ei1001:
+            raise_for_code(ApiErrorPayload(code=1001, message="timeout"))
+        assert "[1000]" in str(ei1000.value)
+        assert "[1001]" in str(ei1001.value)
+        # Different codes → different strings.
+        assert str(ei1000.value) != str(ei1001.value)
+
+    def test_rate_limit_error_is_subclass_of_minipic(self) -> None:
+        """Regression guard: RateLimitError must remain a MiniPicError so
+        existing ``except MiniPicError`` catch sites keep working."""
+        assert issubclass(RateLimitError, MiniPicError)
 
     def test_zero_code_raises_base(self) -> None:
         """0 means 'unknown code', must still raise something."""
@@ -143,7 +184,7 @@ class TestRaiseForCodeUnknown:
 class TestHierarchy:
     def test_all_specific_errors_subclass_minipic(self) -> None:
         for cls in (AuthError, BalanceError, SafetyError, InvalidParamsError,
-                    ServerError):
+                    ServerError, RateLimitError):
             assert issubclass(cls, MiniPicError)
 
     def test_specific_subclasses_can_be_caught_as_base(self) -> None:

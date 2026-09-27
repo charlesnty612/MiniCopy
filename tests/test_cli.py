@@ -355,6 +355,66 @@ class TestCreateT2V:
         assert isinstance(result.exception, ConfigError)
         assert "API key" in str(result.exception)
 
+    def test_aigc_watermark_flag_forwarded(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        """--aigc-watermark flows into create_video_task kwargs."""
+        fake_client.create_video_task.return_value = "tid-t2v-wm"
+        result = runner.invoke(main, [
+            "create", "t2v",
+            "--prompt", "x",
+            "--ratio", "16:9",
+            "--aigc-watermark",
+        ])
+        assert result.exit_code == 0, result.output
+        kwargs = fake_client.create_video_task.await_args.kwargs
+        assert kwargs["aigc_watermark"] is True
+
+    def test_prompt_expansion_mode_forwarded_on_h3_max(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        """--prompt-expansion-mode on MiniMax-H3-Max flows through."""
+        fake_client.create_video_task.return_value = "tid-t2v-pm"
+        result = runner.invoke(main, [
+            "create", "t2v",
+            "--prompt", "x",
+            "--ratio", "16:9",
+            "--model", "MiniMax-H3-Max",
+            "--prompt-expansion-mode", "balanced",
+        ])
+        assert result.exit_code == 0, result.output
+        kwargs = fake_client.create_video_task.await_args.kwargs
+        assert kwargs["prompt_expansion_mode"] == "balanced"
+        assert kwargs["model"] == "MiniMax-H3-Max"
+
+    def test_prompt_expansion_mode_rejects_h3(
+        self, runner: CliRunner, fake_config: Config
+    ) -> None:
+        """prompt_expansion_mode on MiniMax-H3 exits with a clear message."""
+        result = runner.invoke(main, [
+            "create", "t2v",
+            "--prompt", "x",
+            "--ratio", "16:9",
+            "--model", "MiniMax-H3",
+            "--prompt-expansion-mode", "balanced",
+        ])
+        assert result.exit_code != 0
+        assert "MiniMax-H3-Max" in result.output
+
+    def test_prompt_expansion_mode_invalid_choice(
+        self, runner: CliRunner, fake_config: Config
+    ) -> None:
+        """Click rejects values outside {disabled, balanced, quality}."""
+        result = runner.invoke(main, [
+            "create", "t2v",
+            "--prompt", "x",
+            "--ratio", "16:9",
+            "--model", "MiniMax-H3-Max",
+            "--prompt-expansion-mode", "turbo",
+        ])
+        # Click exits 2 on UsageError (invalid choice)
+        assert result.exit_code == 2
+
 
 # --------------------------------------------------------------------------- create i2v
 class TestCreateI2V:
@@ -391,6 +451,61 @@ class TestCreateI2V:
         content = fake_client.create_video_task.await_args.kwargs["content"]
         img = [c for c in content if c.get("type") == "image_url"][0]
         assert img["role"] == "last_frame"
+
+    def test_aigc_watermark_flag_forwarded(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        """i2v: --aigc-watermark still flows to create_video_task."""
+        fake_client.create_video_task.return_value = "tid-i2v-wm"
+        result = runner.invoke(main, [
+            "create", "i2v",
+            "--prompt", "x",
+            "--ref-image", "https://cdn/a.jpg",
+            "--aigc-watermark",
+        ])
+        assert result.exit_code == 0, result.output
+        kwargs = fake_client.create_video_task.await_args.kwargs
+        assert kwargs["aigc_watermark"] is True
+        # i2v still forces ratio=adaptive regardless of the watermark flag
+        assert kwargs["ratio"] == "adaptive"
+
+    def test_prompt_expansion_mode_forwarded_on_h3_max(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        """i2v on H3-Max: --prompt-expansion-mode flows through."""
+        fake_client.create_video_task.return_value = "tid-i2v-pm"
+        result = runner.invoke(main, [
+            "create", "i2v",
+            "--prompt", "x",
+            "--ref-image", "https://cdn/a.jpg",
+            "--model", "MiniMax-H3-Max",
+            "--prompt-expansion-mode", "disabled",
+        ])
+        assert result.exit_code == 0, result.output
+        kwargs = fake_client.create_video_task.await_args.kwargs
+        assert kwargs["prompt_expansion_mode"] == "disabled"
+
+    def test_context_ir_call_does_not_receive_extras(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient
+    ) -> None:
+        """i2v path: Context-IR has no aigc_watermark / prompt_expansion_mode
+        kwargs — only the create_video_task call does. Verifies the i2v branch
+        didn't accidentally leak the new flags into create_context_ir_task.
+        """
+        fake_client.create_video_task.return_value = "tid-i2v-noctx"
+        # Enable context-ir rewrite (default) so the IR path runs.
+        fake_client.fetch_context_ir_prompt.return_value = "rewritten"
+        runner.invoke(main, [
+            "create", "i2v",
+            "--prompt", "x",
+            "--ref-image", "https://cdn/a.jpg",
+            "--model", "MiniMax-H3",
+            "--aigc-watermark",
+        ])
+        # Context-IR was called without the new kwargs.
+        ir_kwargs = fake_client.create_context_ir_task.await_args.kwargs
+        assert "aigc_watermark" not in ir_kwargs
+        assert "prompt_expansion_mode" not in ir_kwargs
 
 
 # --------------------------------------------------------------------------- create r2v
@@ -500,6 +615,45 @@ class TestCreateR2V:
         assert audios[0]["audio_url"]["url"] == "https://cdn/uploaded"
         # Audio clip duration is propagated to the content[] payload.
         assert audios[0].get("duration") == 8.0
+
+    def test_aigc_watermark_flag_forwarded(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient,
+        tmp_path: Path,
+    ) -> None:
+        """r2v: --aigc-watermark flows to create_video_task."""
+        local = tmp_path / "img.jpg"
+        local.write_bytes(b"x")
+        fake_client.upload_and_resolve.return_value = "https://cdn/uploaded.jpg"
+        fake_client.create_video_task.return_value = "tid-r2v-wm"
+        result = runner.invoke(main, [
+            "create", "r2v",
+            "--prompt", "x",
+            "--ref-image", str(local),
+            "--aigc-watermark",
+        ])
+        assert result.exit_code == 0, result.output
+        kwargs = fake_client.create_video_task.await_args.kwargs
+        assert kwargs["aigc_watermark"] is True
+
+    def test_prompt_expansion_mode_forwarded_on_h3_max(
+        self, runner: CliRunner, fake_config: Config, fake_client: _FakeMiniMaxClient,
+        tmp_path: Path,
+    ) -> None:
+        """r2v on H3-Max: --prompt-expansion-mode flows through."""
+        local = tmp_path / "img.jpg"
+        local.write_bytes(b"x")
+        fake_client.upload_and_resolve.return_value = "https://cdn/uploaded.jpg"
+        fake_client.create_video_task.return_value = "tid-r2v-pm"
+        result = runner.invoke(main, [
+            "create", "r2v",
+            "--prompt", "x",
+            "--ref-image", str(local),
+            "--model", "MiniMax-H3-Max",
+            "--prompt-expansion-mode", "quality",
+        ])
+        assert result.exit_code == 0, result.output
+        kwargs = fake_client.create_video_task.await_args.kwargs
+        assert kwargs["prompt_expansion_mode"] == "quality"
 
 
 # --------------------------------------------------------------------------- status command

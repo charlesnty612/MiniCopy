@@ -651,16 +651,16 @@ a:hover { color: #7fe0ff; }
   <div class="form-section">
     <span class="form-section-title">画面参数</span>
 
-    <label for="ratio">比例（t2v 专用）</label>
+    <label for="ratio">比例 <span id="ratio-hint" style="font-weight:normal;color:#666;font-size:0.9em;"></span></label>
     <select id="ratio">
       <option value="">-- 选择比例 --</option>
-      <option value="adaptive">adaptive</option>
-      <option value="16:9">16:9</option>
-      <option value="9:16">9:16</option>
-      <option value="1:1">1:1</option>
-      <option value="4:3">4:3</option>
-      <option value="3:4">3:4</option>
-      <option value="21:9">21:9</option>
+      <option value="adaptive">adaptive（自适应）</option>
+      <option value="16:9">16:9（横屏）</option>
+      <option value="9:16">9:16（竖屏）</option>
+      <option value="1:1">1:1（方形）</option>
+      <option value="4:3">4:3（横屏）</option>
+      <option value="3:4">3:4（竖屏）</option>
+      <option value="21:9">21:9（超宽）</option>
     </select>
 
     <label for="resolution">分辨率</label>
@@ -724,6 +724,21 @@ a:hover { color: #7fe0ff; }
       <input type="checkbox" id="use-context-ir" checked>
       <span>使用 Context-IR 优化提示词（H3 默认开启 · H3-Max 自动跳过 · 失败时回退原文）</span>
     </label>
+
+    <label class="checkbox-label">
+      <input type="checkbox" id="aigc-watermark">
+      <span>添加 AIGC 标识水印（默认关闭）</span>
+    </label>
+
+    <label for="prompt-expansion-mode" style="margin-top:10px;display:inline-block">
+      提示词扩写模式
+      <span style="font-weight:normal;color:#666;font-size:0.9em;">（仅 MiniMax-H3-Max 支持）</span>
+    </label>
+    <select id="prompt-expansion-mode">
+      <option value="">默认（balanced，不显式传）</option>
+      <option value="disabled">关闭扩写（disabled）</option>
+      <option value="quality">质量优先扩写（quality）</option>
+    </select>
   </div>
 
   <div id="submit-row">
@@ -776,7 +791,27 @@ function updateModeUI() {
   const m = getMode();
   $('i2v-row').style.display = m === 'i2v' ? 'block' : 'none';
   $('r2v-section').style.display = m === 'r2v' ? 'block' : 'none';
-  $('ratio').disabled = m !== 't2v';
+  // i2v 模式禁用比例（恒 adaptive）；t2v / r2v 启用。
+  const ratio = $('ratio');
+  ratio.disabled = (m === 'i2v');
+  // 模式切换时的比例默认值联动：
+  //  r2v 默认 adaptive；t2v 必须选具体比例（若当前值是 adaptive 或空则清空，强制用户选）。
+  const hint = $('ratio-hint');
+  if (m === 't2v') {
+    hint.textContent = '（必选具体比例，不可 adaptive）';
+    if (!ratio.value || ratio.value === 'adaptive') {
+      ratio.value = '';
+    }
+  } else if (m === 'i2v') {
+    hint.textContent = '（由首/尾帧图片决定，无需选择）';
+  } else if (m === 'r2v') {
+    hint.textContent = '（可选，默认 adaptive（自适应））';
+    if (!ratio.value) {
+      ratio.value = 'adaptive';
+    }
+  } else {
+    hint.textContent = '';
+  }
 }
 updateModeUI();
 
@@ -826,6 +861,10 @@ function buildPayload() {
     ref_audios: [],
     wait: $('wait').checked,
     use_context_ir: $('use-context-ir').checked,
+    aigc_watermark: $('aigc-watermark').checked,
+    prompt_expansion_mode: $('model').value === 'MiniMax-H3-Max'
+      ? ($('prompt-expansion-mode').value || null)
+      : null,
   };
 
   if (mode === 'i2v') {
@@ -1196,6 +1235,14 @@ function applyModelConstraints() {
 
   // i2v 角色已固定为首帧 + 可选尾帧（v0.1.6+），无需再按模型动态重建。
   // i2v_roles 字段保留在 /api/config 响应里供上层使用。
+
+  // prompt_expansion_mode 仅 MiniMax-H3-Max 支持；其它模型禁用并重置。
+  const pe = $('prompt-expansion-mode');
+  if (pe) {
+    const isH3Max = (model === 'MiniMax-H3-Max');
+    pe.disabled = !isH3Max;
+    if (!isH3Max) pe.value = '';
+  }
 
   updateDurationSummary();
 }

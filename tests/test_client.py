@@ -24,7 +24,9 @@ from minipic.errors import (
     BalanceError,
     ConfigError,
     InvalidParamsError,
+    MiniPicError,
     RETRYABLE_CODES,
+    RateLimitError,
     SafetyError,
     TaskError,
 )
@@ -535,3 +537,241 @@ class TestContextIRDefaults:
                 duration=10,
                 ratio="adaptive",
             ))
+
+
+# --------------------------------------------------------------------------- create_video_task: V2 optional pass-through fields
+class TestCreateVideoTaskV2Extras:
+    """Cover task-4 additions:
+      - aigc_watermark (bool, both models) sent as a top-level payload field;
+      - extra.prompt_expansion_mode (MiniMax-H3-Max only);
+      - rejection when prompt_expansion_mode is set on MiniMax-H3;
+      - rejection of out-of-enum prompt_expansion_mode values.
+    """
+
+    @pytest.mark.asyncio
+    async def test_aigc_watermark_true_passed_through(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(req.content))
+            return ok_response({"task_id": "tid-wm-1"})
+
+        c = MiniMaxClient(Config(api_key="k"))
+        transport = httpx.MockTransport(handler)
+        async with c as client:
+            client._client = httpx.AsyncClient(base_url="https://x", transport=transport)
+            tid = await client.create_video_task(
+                model="MiniMax-H3",
+                content=[{"type": "text", "text": "x"}],
+                duration=5,
+                ratio="16:9",
+                aigc_watermark=True,
+            )
+        assert tid == "tid-wm-1"
+        assert seen["aigc_watermark"] is True
+        # aigc_watermark is a top-level field — no extra wrapper should appear.
+        assert "extra" not in seen
+
+    @pytest.mark.asyncio
+    async def test_aigc_watermark_omitted_when_none(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(req.content))
+            return ok_response({"task_id": "tid-wm-2"})
+
+        c = MiniMaxClient(Config(api_key="k"))
+        transport = httpx.MockTransport(handler)
+        async with c as client:
+            client._client = httpx.AsyncClient(base_url="https://x", transport=transport)
+            await client.create_video_task(
+                model="MiniMax-H3",
+                content=[{"type": "text", "text": "x"}],
+                duration=5,
+                ratio="16:9",
+                # aigc_watermark defaults to None → field omitted
+            )
+        assert "aigc_watermark" not in seen
+        assert "extra" not in seen
+
+    @pytest.mark.asyncio
+    async def test_prompt_expansion_mode_h3_max_passed_through(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(req.content))
+            return ok_response({"task_id": "tid-pm-1"})
+
+        c = MiniMaxClient(Config(api_key="k"))
+        transport = httpx.MockTransport(handler)
+        async with c as client:
+            client._client = httpx.AsyncClient(base_url="https://x", transport=transport)
+            tid = await client.create_video_task(
+                model="MiniMax-H3-Max",
+                content=[{"type": "text", "text": "x"}],
+                duration=5,
+                ratio="16:9",
+                prompt_expansion_mode="balanced",
+            )
+        assert tid == "tid-pm-1"
+        assert seen["extra"] == {"prompt_expansion_mode": "balanced"}
+        assert "prompt_expansion_mode" not in seen  # nested under extra
+
+    @pytest.mark.asyncio
+    async def test_prompt_expansion_mode_omitted_when_none(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.update(json.loads(req.content))
+            return ok_response({"task_id": "tid-pm-2"})
+
+        c = MiniMaxClient(Config(api_key="k"))
+        transport = httpx.MockTransport(handler)
+        async with c as client:
+            client._client = httpx.AsyncClient(base_url="https://x", transport=transport)
+            await client.create_video_task(
+                model="MiniMax-H3-Max",
+                content=[{"type": "text", "text": "x"}],
+                duration=5,
+                ratio="16:9",
+            )
+        assert "extra" not in seen
+        assert "prompt_expansion_mode" not in seen
+
+    @pytest.mark.asyncio
+    async def test_prompt_expansion_mode_rejects_h3_model(self) -> None:
+        c = MiniMaxClient(Config(api_key="k"))
+        async with c as client:
+            with pytest.raises(ConfigError, match="only supported by MiniMax-H3-Max"):
+                await client.create_video_task(
+                    model="MiniMax-H3",
+                    content=[{"type": "text", "text": "x"}],
+                    duration=5,
+                    ratio="16:9",
+                    prompt_expansion_mode="balanced",
+                )
+
+    @pytest.mark.asyncio
+    async def test_prompt_expansion_mode_rejects_invalid_value(self) -> None:
+        c = MiniMaxClient(Config(api_key="k"))
+        async with c as client:
+            with pytest.raises(ConfigError, match="invalid prompt_expansion_mode"):
+                await client.create_video_task(
+                    model="MiniMax-H3-Max",
+                    content=[{"type": "text", "text": "x"}],
+                    duration=5,
+                    ratio="16:9",
+                    prompt_expansion_mode="turbo",  # not in the official enum
+                )
+
+
+# --------------------------------------------------------------------------- error-code fallback (V2 has no numeric `code`)
+class TestErrorCodeFallback:
+    """The official V2 error body has no numeric ``code`` field — the code
+    only appears as ``(NNNN)`` at the end of the message string. Without
+    extraction, RETRYABLE_CODES (1000/1001/1002) never matches and the rate
+    limit / server error paths silently fall through to a generic exception.
+    """
+
+    @pytest.mark.asyncio
+    async def test_message_tail_1002_triggers_retry_then_rate_limit_error(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """First 3 responses look like a rate-limit (1002), 4th returns the
+        task_id. The retry loop should exhaust then raise RateLimitError.
+        """
+        attempt = {"n": 0}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            attempt["n"] += 1
+            # 429 with the official body shape — no top-level code, only
+            # the "(1002)" suffix in the message.
+            return err_response(429, {
+                "type": "error",
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": "rate limit, please retry later (1002)",
+                    "http_code": "429",
+                },
+                "request_id": "req-abc",
+            })
+
+        c = MiniMaxClient(Config(api_key="k"))
+        # Speed up backoff so the test finishes quickly. monkeypatch restores
+        # the original on test teardown — no cross-test pollution even if an
+        # earlier test failed mid-run.
+        import minipic.client as client_mod
+        monkeypatch.setattr(client_mod, "_backoff", lambda attempt: 0.001)
+        transport = httpx.MockTransport(handler)
+        async with c as client:
+            client._client = httpx.AsyncClient(base_url="https://x", transport=transport)
+            # v0.2.6+: _CODE_TO_EXC now maps 1002 → RateLimitError, so after
+            # the retry budget (4 attempts) is exhausted, raise_for_code
+            # raises the dedicated RateLimitError — not the generic
+            # MiniPicError fallback.
+            with pytest.raises(RateLimitError) as exc_info:
+                await client.create_video_task(
+                    model="MiniMax-H3",
+                    content=[{"type": "text", "text": "x"}],
+                    duration=5,
+                )
+        # Message should include the extracted code AND the http status —
+        # proof the message-tail extraction happened *before* raise_for_code.
+        assert "[1002]" in str(exc_info.value)
+        assert "http=429" in str(exc_info.value)
+        # Retry budget: 4 attempts (max_attempts=4). Before this fix, the
+        # code parsed as 0 → fell through to MiniPicError on attempt 1.
+        assert attempt["n"] == 4
+
+    @pytest.mark.asyncio
+    async def test_message_tail_1026_maps_to_safety_error(self) -> None:
+        """1026 isn't in RETRYABLE_CODES, so it's raised immediately as
+        SafetyError — proving the extraction happens *before* the retry
+        check, not after.
+        """
+        from minipic.errors import SafetyError
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            return err_response(400, {
+                "type": "error",
+                "error": {
+                    "type": "safety_error",
+                    "message": "content violates policy (1026)",
+                    "http_code": "400",
+                },
+            })
+
+        c = MiniMaxClient(Config(api_key="k"))
+        transport = httpx.MockTransport(handler)
+        async with c as client:
+            client._client = httpx.AsyncClient(base_url="https://x", transport=transport)
+            with pytest.raises(SafetyError, match=r"\[1026\]"):
+                await client.create_video_task(
+                    model="MiniMax-H3",
+                    content=[{"type": "text", "text": "x"}],
+                    duration=5,
+                )
+
+    @pytest.mark.asyncio
+    async def test_message_without_code_falls_through_to_generic(self) -> None:
+        """A message with no ``(NNNN)`` suffix should still raise — just as
+        a generic MiniPicError with the raw message text.
+        """
+        from minipic.errors import MiniPicError
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            return err_response(500, {
+                "type": "error",
+                "error": {"message": "something exploded, no code"},
+            })
+
+        c = MiniMaxClient(Config(api_key="k"))
+        transport = httpx.MockTransport(handler)
+        async with c as client:
+            client._client = httpx.AsyncClient(base_url="https://x", transport=transport)
+            with pytest.raises(MiniPicError, match="something exploded"):
+                await client.create_video_task(
+                    model="MiniMax-H3",
+                    content=[{"type": "text", "text": "x"}],
+                    duration=5,
+                )

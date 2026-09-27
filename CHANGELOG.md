@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.6] - 2026-09-27
+
+### Added
+- **比例（ratio）对齐官方口径，放开 r2v 可选比例**：官方 API（platform.minimax.cn/docs/api-reference/video-generation-v2-create）明确 ratio 枚举 `adaptive|21:9|16:9|4:3|1:1|3:4|9:16`，t2v 必填非 adaptive、i2v 恒 adaptive（由首/尾帧图决定）、r2v 可选默认 adaptive。Web UI 比例下拉改为仅 i2v 禁用（此前 r2v 被误禁），标签"比例（t2v 专用）"改为"比例"+ 按模式动态提示；选项加中文注释（16:9 横屏 / 9:16 竖屏等）；r2v 默认自适应，t2v 强制选具体比例。后端 `CreateBody.ratio` 增加枚举 pattern 校验（非法值 422）。
+- **新增 AIGC 水印开关（`aigc_watermark`）**：Web"生成选项"区新增复选框（默认关闭），CLI 三命令（t2v/i2v/r2v）新增 `--aigc-watermark`，两模型通用，透传至 `/v2/video_generation`。
+- **新增提示词扩写模式（`extra.prompt_expansion_mode`，仅 MiniMax-H3-Max）**：取值 `disabled|balanced|quality`，默认 balanced（不显式传）。Web 新增下拉并随模型联动（H3 时禁用置空），CLI 新增 `--prompt-expansion-mode`；H3 模型传该参数在 Web（400）、CLI（退出码 1）、client（ConfigError）三层均显式拒绝。
+
+### Fixed
+- **错误码解析缺陷：429 限流此前永不重试**。官方错误体无数字 `code` 字段，错误码仅在 `message` 尾部 `(NNNN)` 中；旧解析恒得 code=0，导致 `RETRYABLE_CODES`（1000/1001/1002）永不命中——限流（429/1002）不自动重试，安全拦截（1026）、余额不足（1008）等也映射不到专用异常。现增加 message 尾部正则兜底提取；`errors.py` `_CODE_TO_EXC` 补齐 1000/1001→`ServerError`、1002→`RateLimitError` 映射。
+
+### Notes
+- 明确不接入 `callback_url`：回调需公网可达地址 + challenge 握手，本软件为本地轮询架构，用不到。
+- 测试：全量 438 passed（新增 29 条覆盖透传/校验/错误码兜底）；审查打回的 6 处 minor（测试命名、monkeypatch 污染、`extra` 改为 setdefault 累积式写入等）已闭环。
+
 ## [0.2.5] - 2026-09-23
 
 ### Changed
