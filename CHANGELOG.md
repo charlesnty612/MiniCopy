@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.2.8] - 2026-11-25
+
+### Added
+- **多服务商支持（provider 抽象）**：同一套 MiniMax H3 V2 协议现在可对接两家。`config.PROVIDERS` 注册表集中声明每家服务商的端点、上传路径、可用模型、线上模型 ID 与能力开关；`provider` 成为与 `api_key` 同级的一等配置项（优先级同为 user > local > env，新增 `MINIPIC_PROVIDER`）。
+  - `minimax`（默认）：`https://api.minimaxi.com`，H3 / H3-Max，768P/2K，Context-IR 与 image-01 全可用，上传走 `/v1/files/upload`。
+  - `vectron`（拓元 Vectron 内测）：`https://api.vectron.meta-stone.com`，仅 `MiniMax-H3`，480P/768P，上传走 `/v1/h3/files/upload`；线上模型 ID 需写 `MiniMax/MiniMax-H3`。
+- **模型 ID 翻译层**：`resolve_model_id(provider, model)` 在请求落地前把内部规范名（`MiniMax-H3`）翻成服务商线路 ID（拓元：`MiniMax/MiniMax-H3`）。内部账本、UI、CLI 一律继续使用规范名，不会因换服务商而混淆。
+- **Web UI 服务商选择器**：Key 弹窗新增「服务商」下拉 + 能力提示；保存即同时落盘 key 与 provider。切换后模型下拉、分辨率档位、Context-IR 勾选框、prompt_expansion 开关自动按新服务商重建/禁用。
+- **记录级计费归属**：任务 `extra` 落 `provider`，费用估算按任务实际扣费的服务商价格表计算（拓元内测 ¥0.05/s ≈ 官方 1 折），后切服务商不会改写历史任务的估算。
+
+### Fixed
+- **拓元状态词与错误码**：拓元返回小写状态（`succeeded`/`failed`/`cancelled`）且错误体只有裸 HTTP 状态、无 `(NNNN)` 数字码。`poller` 现统一用 `is_success`/`is_failure` 判定双写法；`errors.raise_for_code` 新增 HTTP 状态兜底映射（400→参数、401→鉴权、402→余额、422→敏感内容、429→限流、5xx→服务端），`client` 对 429/5xx 同样走退避重试。此前这些错误会静默落到通用 `MiniPicError` 且不重试。
+- **拓元上传响应解析**：上传返回 `{"id": ...}` 而非官方的嵌套 `file.file_id`，新增 `_extract_file_id` 兼容三种形态。
+
+### Changed
+- `validate_model_params` / `validate_model_modes` 增加 `provider` 参数，按服务商能力集校验（拓元无 2K、无 H3-Max）。
+- `Config` 新增 `provider` / `effective_base_url()` / `upload_path` / `supports_context_ir` / `supports_image_generation`；显式设置的 `base_url` 仍视为覆盖并优先，仅当其为默认值时才跟随 provider 端点。
+- 切换服务商时自动清空陈旧的 `base_url` 覆盖（`POST /api/config` 与 `minipic config set provider`），避免官方端点被写死后选了拓元也不生效。
+- Context-IR / image-01 在能力缺失的服务商上改为在客户端先行抛 `ConfigError`（原先会打到服务端换回 404）。
+
+### Notes
+- 测试：全量 505 passed（新增 `tests/test_provider.py` 55 条：注册表、模型 ID 翻译、端点解析、上传双形态、能力守卫、HTTP 状态错误映射、双写法状态、Web 侧 provider 配置与建单跳过 Context-IR）。另有 1 条 Windows `platformdirs` 路径断言在本机环境长期失败，与本次改动无关（改动前后一致）。
+- 未做任何真实扣费调用：验证全部走 `httpx.MockTransport` 与本地 TestClient。
+
 ## [0.2.7] - 2026-09-27
 
 ### Added

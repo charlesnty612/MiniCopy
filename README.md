@@ -2,8 +2,10 @@
 
 本地 CLI + 极简网页 UI，把 MiniMax H3 视频生成（文生视频 / 图生视频 / 多模态参考）包成日常能用的工具。
 
-- **后端**：MiniMax 公开 API（`https://api.minimaxi.com`，需自备 API Key）
-- **模型**：`MiniMax-H3` / `MiniMax-H3-Max`（V2 端点）
+- **后端**：MiniMax H3 V2 协议，可选两家服务商（需自备对应 API Key）
+  - `minimax`（默认）：MiniMax 开放平台，`https://api.minimaxi.com`
+  - `vectron`：拓元 Vectron 内测，`https://api.vectron.meta-stone.com`（官方约 1 折，仅 H3）
+- **模型**：`MiniMax-H3` / `MiniMax-H3-Max`（V2 端点；拓元只提供 `MiniMax-H3`）
 - **支持模式**：
   - `t2v`：纯文本 → 视频
   - `i2v`：首帧图（+ 可选尾帧图） + 文本 → 视频
@@ -11,13 +13,32 @@
 
 ## 模型能力
 
-| 模型 | 模式 | i2v 帧 | 分辨率 | 时长 |
-|------|------|--------|--------|------|
-| `MiniMax-H3` | t2v / i2v / r2v | 首帧 / 尾帧 | 768P / 2K | 4–15s |
-| `MiniMax-H3-Max` | t2v / i2v / r2v | 首帧 / 尾帧 | 480P / 768P | 5–15s |
+| 服务商 | 模型 | 模式 | i2v 帧 | 分辨率 | 时长 |
+|--------|------|------|--------|--------|------|
+| `minimax` | `MiniMax-H3` | t2v / i2v / r2v | 首帧 / 尾帧 | 768P / 2K | 4–15s |
+| `minimax` | `MiniMax-H3-Max` | t2v / i2v / r2v | 首帧 / 尾帧 | 480P / 768P | 5–15s |
+| `vectron` | `MiniMax-H3` | t2v / i2v / r2v | 首帧 / 尾帧 | 480P / 768P | 4–15s |
 
 - H3-Max 仍**不支持中间帧**（官方 API schema 的 role 枚举只有 `first_frame` / `last_frame` / `reference_*`，没有 `middle_frame`）。
 - 参考视频 / 音频仅支持 **≤15s 单段**（多段生成已移除，>15s 会报错提示先截取）。
+- **服务商能力差异**：拓元目前只提供 `MiniMax-H3`，**无 2K 分辨率、无 H3-Max、无 Context-IR 提示词优化、无 image-01 生图**；切到拓元后 UI 会自动隐藏/禁用这些能力，并在提交前本地拦截。
+
+## 切换服务商
+
+网页 UI 点右上角「API Key」，在弹窗里选「服务商」后填对应 key 保存即可。
+
+CLI / 环境变量等价写法：
+
+```bash
+# 用户配置（推荐；UI 与 CLI 共用同一份）
+minipic config set provider vectron
+minipic config set api_key <拓元 key>
+
+# 或者用环境变量（仅当文件里没存 provider 时兜底）
+export MINIPIC_PROVIDER=vectron
+```
+
+> 切换服务商时会自动清掉旧的 `base_url` 覆盖，使新服务商的端点生效。任务记录里会记下 `provider`，历史任务仍按当时实际计费的服务商价格估算。
 
 ## 安装
 
@@ -40,9 +61,10 @@ minipic config set api_key eyJhbGciOi...
 $env:MINIMAX_API_KEY="eyJhbGciOi..."
 ```
 
-> API key 优先级：**用户配置（`~/.config/minipic/config.json`）> 项目目录 `config.json` > 环境变量（兜底）**。在网页 UI 里保存的 key 对所有入口生效，重启后仍有效。
+> API key 优先级：**用户配置（`~/.config/minipic/config.json`）> 项目目录 `config.json` > 环境变量（兜底）**。在网页 UI 里保存的 key 对所有入口生效，重启后仍有效。`provider` 遵循同样的优先级（`MINIPIC_PROVIDER` 仅在文件未指定时兜底）。
 
 > 国际区请把 base_url 改成 `https://api.minimax.io`：`minipic config set base_url https://api.minimax.io`
+> （显式设置 `base_url` 即视为覆盖，会压过所选服务商的默认端点。）
 
 ## CLI 用法
 
@@ -89,7 +111,9 @@ minipic web          # 浏览器打开 http://127.0.0.1:7860
 
 ## 费用预估
 
-按 MiniMax 官方按量计费刊例价（人民币，[platform.minimaxi.com/docs/guides/pricing-paygo](https://platform.minimaxi.com/docs/guides/pricing-paygo)）：
+UI 的费用栏按**任务实际使用的服务商**取价，历史记录不会被后来的切换改写。
+
+**官方 `minimax`**——MiniMax 按量计费刊例价（人民币，[platform.minimaxi.com/docs/guides/pricing-paygo](https://platform.minimaxi.com/docs/guides/pricing-paygo)）：
 
 | 分辨率 | 单价      | 10s 视频 |
 |--------|-----------|----------|
@@ -98,17 +122,19 @@ minipic web          # 浏览器打开 http://127.0.0.1:7860
 
 输入素材：音频免费；参考图片 5 张内免费、超出 ¥0.20/张；参考视频按生成分辨率同价计费（2K ¥0.80/s、768P ¥0.50/s）。
 
+**拓元 `vectron`（内测价）**：统一 **¥0.05/秒**，不区分分辨率与输入视频（约为官方 1 折）。内测默认额度 100 元 ≈ 2000s 视频。价格以服务商最终账单为准。
+
 ## 项目结构
 
 ```
 minipic/
 ├── src/minipic/
-│   ├── config.py      # 配置加载（key 优先级 user > local > env）+ 模型能力约束
-│   ├── client.py      # httpx 异步客户端（submit / query / upload / download）
+│   ├── config.py      # 配置加载（key/provider 优先级 user > local > env）+ 服务商与模型能力约束
+│   ├── client.py      # httpx 异步客户端（submit / query / upload / download，按 provider 切换端点与模型 ID）
 │   ├── media.py       # 本地媒体校验 + 上传解析 + 共享的 content 构建 / 下载
-│   ├── poller.py      # 异步轮询 + 进度回调
+│   ├── poller.py      # 异步轮询 + 进度回调（兼容两家的大小写状态）
 │   ├── storage.py     # SQLite 任务库 + 视频落盘
-│   ├── errors.py      # 错误码 → 异常映射
+│   ├── errors.py      # 错误码 / HTTP 状态 → 异常映射
 │   ├── cli.py         # click 命令（create / status / wait / list / web ...）
 │   └── web.py         # FastAPI 路由（/api/create / /api/config / /api/upload ...）
 ├── web/
@@ -123,6 +149,8 @@ minipic/
 ```bash
 pytest
 ```
+
+> Windows 上若 `%TEMP%` 权限受限，加 `--basetemp=.ptmp` 指定项目内临时目录。
 
 ## 留痕
 

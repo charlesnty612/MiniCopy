@@ -71,7 +71,11 @@ def fake_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
 class _FakeMiniMaxClient:
     """Async context manager stub for MiniMaxClient (CLI's expected pattern)."""
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: Any = None) -> None:
+        # The real client exposes ``cfg``; CLI code reads capability flags
+        # (e.g. supports_context_ir) through it, so the stub mirrors that.
+        from minipic.config import Config as _Config
+        self.cfg = cfg if cfg is not None else _Config(api_key="k")
         self.create_video_task = AsyncMock(return_value="tid-default")
         self.query_video_task = AsyncMock(
             return_value={"status": STATUS_SUCCEEDED,
@@ -100,7 +104,10 @@ class _FakeMiniMaxClient:
 @pytest.fixture
 def fake_client(monkeypatch: pytest.MonkeyPatch) -> _FakeMiniMaxClient:
     fake = _FakeMiniMaxClient()
-    monkeypatch.setattr(cli_mod, "MiniMaxClient", lambda cfg: fake)
+    monkeypatch.setattr(
+        cli_mod, "MiniMaxClient",
+        lambda cfg: setattr(fake, "cfg", cfg) or fake,
+    )
     return fake
 
 

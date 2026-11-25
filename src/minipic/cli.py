@@ -21,6 +21,7 @@ from .config import (
     Config,
     ensure_dirs,
     load_config,
+    normalize_provider,
     require_api_key,
     save_config,
     validate_model_modes,
@@ -36,6 +37,7 @@ from .poller import (
     STATUS_QUEUED,
     STATUS_RUNNING,
     STATUS_SUCCEEDED,
+    is_success,
     poll_until_done,
 )
 from .storage import (
@@ -123,11 +125,13 @@ async def _maybe_apply_context_ir(
     """Optionally rewrite ``content[0].text`` via H3-Context-IR.
 
     Returns True if the prompt was actually rewritten, False otherwise
-    (skipped, H3-Max, empty response, or any error). All failures are
-    swallowed silently with a warning log — Context-IR is a nice-to-have,
-    never a gate for the real submission.
+    (skipped, H3-Max, provider without Context-IR, empty response, or any
+    error). All failures are swallowed silently with a warning log —
+    Context-IR is a nice-to-have, never a gate for the real submission.
     """
     if model != "MiniMax-H3":
+        return False
+    if not client.cfg.supports_context_ir:
         return False
     if not content or content[0].get("type") != "text":
         return False
@@ -177,14 +181,20 @@ def config_show() -> None:
     help='Write to user config dir (default) or ./config.json ("local").',
 )
 def config_set(key: str, value: str, scope: str) -> None:
-    """Persist a config key/value pair."""
+    """Persist a config key/value pair.
+
+    ``provider`` (``minimax`` / ``vectron``) selects the vendor; changing it
+    drops a stale ``base_url`` override so the new provider's endpoint wins.
+    """
     cfg = load_config()
     # Apply to a dataclass
     if not hasattr(cfg, key):
-        _print(f"[red]Unknown config key: {key}[/red]")
+        _print(
+            f"[red]Unknown config key: {key}[/red]\n"
+            f"Available: {', '.join(sorted(cfg.__dataclass_fields__))}"
+        )
         raise SystemExit(1)
     # Type coercion
-    field_val = cfg.__dataclass_fields__[key]
     current = getattr(cfg, key)
     if isinstance(current, bool):
         coerced = value.lower() in ("true", "1", "yes")
@@ -203,7 +213,18 @@ def config_set(key: str, value: str, scope: str) -> None:
     else:
         coerced = value
 
+    if key == "provider":
+        try:
+            coerced = normalize_provider(coerced)
+        except ConfigError as e:
+            _print(f"[red]{e}[/red]")
+            raise SystemExit(1)
+
     setattr(cfg, key, coerced)
+    if key == "provider":
+        # A saved concrete base_url would otherwise keep pinning the previous
+        # vendor's host; reset it so effective_base_url() follows the provider.
+        cfg.base_url = cfg.effective_base_url()
     path = save_config(cfg, scope=scope)
     _print(f"Saved {key}={value!r} to {path}")
 
@@ -240,7 +261,9 @@ def create_group() -> None:
     "model",
     type=click.Choice(API_MODELS, case_sensitive=False),
     default="MiniMax-H3",
-    help="Generation model. Default: MiniMax-H3.",
+    help="Generation model (canonical names; validated against the configured "
+         "provider — e.g. the Vectron provider serves MiniMax-H3 only). "
+         "Default: MiniMax-H3.",
 )
 @click.option(
     "--wait/--no-wait",
@@ -251,7 +274,8 @@ def create_group() -> None:
     "--no-context-ir",
     is_flag=True,
     default=False,
-    help="Disable H3-Context-IR prompt rewrite (H3 only; H3-Max auto-skips).",
+    help="Disable H3-Context-IR prompt rewrite (H3 only; H3-Max and "
+         "non-official providers auto-skip).",
 )
 @click.option(
     "--aigc-watermark/--no-aigc-watermark",
@@ -292,8 +316,11 @@ def create_t2v(
     duration_val = duration if duration is not None else cfg.default_duration
 
     try:
-        validate_model_params(model, resolution=resolution, duration=duration_val)
-        validate_model_modes(model, mode="t2v")
+        validate_model_params(
+            model, resolution=resolution, duration=duration_val,
+            provider=cfg.provider_key(),
+        )
+        validate_model_modes(model, mode="t2v", provider=cfg.provider_key())
     except ConfigError as e:
         _print(f"[red]{e}[/red]")
         raise SystemExit(1)
@@ -358,7 +385,9 @@ def create_t2v(
     "model",
     type=click.Choice(API_MODELS, case_sensitive=False),
     default="MiniMax-H3",
-    help="Generation model. Default: MiniMax-H3.",
+    help="Generation model (canonical names; validated against the configured "
+         "provider — e.g. the Vectron provider serves MiniMax-H3 only). "
+         "Default: MiniMax-H3.",
 )
 @click.option(
     "--wait/--no-wait",
@@ -369,7 +398,8 @@ def create_t2v(
     "--no-context-ir",
     is_flag=True,
     default=False,
-    help="Disable H3-Context-IR prompt rewrite (H3 only; H3-Max auto-skips).",
+    help="Disable H3-Context-IR prompt rewrite (H3 only; H3-Max and "
+         "non-official providers auto-skip).",
 )
 @click.option(
     "--aigc-watermark/--no-aigc-watermark",
@@ -408,8 +438,14 @@ def create_i2v(
     duration_val = duration if duration is not None else cfg.default_duration
 
     try:
-        validate_model_params(model, resolution=resolution, duration=duration_val)
-        validate_model_modes(model, mode="i2v", i2v_role=ref_image_role)
+        validate_model_params(
+            model, resolution=resolution, duration=duration_val,
+            provider=cfg.provider_key(),
+        )
+        validate_model_modes(
+            model, mode="i2v", i2v_role=ref_image_role,
+            provider=cfg.provider_key(),
+        )
     except ConfigError as e:
         _print(f"[red]{e}[/red]")
         raise SystemExit(1)
@@ -495,7 +531,9 @@ def create_i2v(
     "model",
     type=click.Choice(API_MODELS, case_sensitive=False),
     default="MiniMax-H3",
-    help="Generation model. Default: MiniMax-H3.",
+    help="Generation model (canonical names; validated against the configured "
+         "provider — e.g. the Vectron provider serves MiniMax-H3 only). "
+         "Default: MiniMax-H3.",
 )
 @click.option(
     "--wait/--no-wait",
@@ -506,7 +544,8 @@ def create_i2v(
     "--no-context-ir",
     is_flag=True,
     default=False,
-    help="Disable H3-Context-IR prompt rewrite (H3 only; H3-Max auto-skips).",
+    help="Disable H3-Context-IR prompt rewrite (H3 only; H3-Max and "
+         "non-official providers auto-skip).",
 )
 @click.option(
     "--aigc-watermark/--no-aigc-watermark",
@@ -547,8 +586,11 @@ def create_r2v(
     duration_val = duration if duration is not None else cfg.default_duration
 
     try:
-        validate_model_params(model, resolution=resolution, duration=duration_val)
-        validate_model_modes(model, mode="r2v")
+        validate_model_params(
+            model, resolution=resolution, duration=duration_val,
+            provider=cfg.provider_key(),
+        )
+        validate_model_modes(model, mode="r2v", provider=cfg.provider_key())
     except ConfigError as e:
         _print(f"[red]{e}[/red]")
         raise SystemExit(1)
@@ -665,7 +707,7 @@ async def _wait_and_download(client: MiniMaxClient, task_id: str, cfg: Config) -
     status = task.get("status", "")
     update_task(task_id, status=status)
 
-    if status == STATUS_SUCCEEDED:
+    if is_success(status):
         videos_dir = Path(cfg.videos_dir).resolve()
         videos_dir.mkdir(parents=True, exist_ok=True)
         dest = videos_dir / f"{task_id}.mp4"
@@ -703,7 +745,7 @@ def status(task_id: str) -> None:
             status_val = task.get("status", "?")
             _print(f"{_status_label(status_val)}  {task_id}")
             # Show video URL if succeeded
-            if status_val == STATUS_SUCCEEDED:
+            if is_success(status_val):
                 content_list = task.get("content") or []
                 for entry in content_list:
                     if isinstance(entry, dict):

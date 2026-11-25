@@ -618,6 +618,12 @@ a:hover { color: #7fe0ff; }
 <dialog id="key-dialog">
   <h3>配置 API Key</h3>
   <div class="status-line" id="key-status-line">加载中…</div>
+  <label class="field-label" for="provider-select">服务商</label>
+  <select id="provider-select">
+    <option value="minimax">MiniMax 开放平台（官方 · api.minimaxi.com）</option>
+    <option value="vectron">拓元 Vectron（H3 内测 · 官方 1 折）</option>
+  </select>
+  <p class="field-hint" id="provider-hint">官方平台：H3 / H3-Max · 768P/2K · Context-IR 提示词优化。</p>
   <label class="field-label" for="key-input">输入新 Key</label>
   <input type="password" id="key-input" placeholder="eyJhbGciOi..." autocomplete="off" />
   <p class="field-hint">Key 保存在本机用户配置目录（<code id="key-save-path">%APPDATA%\minipic\config.json</code>），明文存盘。</p>
@@ -647,6 +653,7 @@ a:hover { color: #7fe0ff; }
       <option value="MiniMax-H3" selected>MiniMax-H3（默认 · 768P/2K · 4-15s · 全能力 · 首帧/尾帧）</option>
       <option value="MiniMax-H3-Max">MiniMax-H3-Max（480P/768P · 5-15s · 支持全能参考 · 首帧/尾帧）</option>
     </select>
+    <p class="field-hint" id="provider-line" style="margin:-4px 0 0"></p>
 
     <label for="prompt" data-required="true">提示词</label>
     <textarea id="prompt" placeholder="描述你想生成的视频内容"></textarea>
@@ -803,6 +810,26 @@ const PRICING = {
   "MiniMax-H3":     { out: {"768P": 0.50, "2K": 0.80}, inVideo: {"768P": 0.50, "2K": 0.80}, imgFree: 5, imgPrice: 0.20 },
   "MiniMax-H3-Max": { out: {"480P": 0.33, "768P": 0.50}, inVideo: {"480P": 0.37, "768P": 0.97}, imgFree: 2, imgPrice: 0.50 },
 };
+
+// v0.2.8 — 服务商价目（国内人民币刊例价）。
+//   官方：MiniMax 刊例价（见上）。
+//   拓元：内测期 0.05 元/s（约官方 1 折），不区分分辨率与输入视频。
+// 老记录只带 model/resolution，没有 provider 字段；那种情况仍按官方价格估算。
+const PROVIDER_PRICING = {
+  minimax: PRICING,
+  vectron: {
+    "MiniMax-H3": { out: {"480P": 0.05, "768P": 0.05}, inVideo: {"480P": 0.05, "768P": 0.05}, imgFree: 9, imgPrice: 0 },
+  },
+};
+
+// v0.2.8 — 当前服务商（/api/config 返回）。
+let activeProvider = 'minimax';
+let providerCatalog = {};   // id -> { label, models, supports_context_ir, ... }
+
+function pricingFor(provider, model) {
+  const table = PROVIDER_PRICING[provider] || PRICING;
+  return (model && table[model]) ? table[model] : null;
+}
 
 function $(id) { return document.getElementById(id); }
 
@@ -1058,6 +1085,7 @@ const STATUS_CN = {
   submitted: '已提交',
   succeeded: '已完成',
   Success: '已完成',
+  Succeeded: '已完成',
   failed: '失败',
   Failed: '失败',
   cancelled: '已取消',
@@ -1098,7 +1126,7 @@ async function loadTasks() {
     }
     ul.innerHTML = tasks.map(function(t) {
       const time = new Date(t.submitted_at).toLocaleString('zh-CN', {timeZone:'Asia/Shanghai'});
-      const dl = (t.output_path || (t.status === 'Success' || t.status === 'succeeded'))
+      const dl = (t.output_path || /^(Success|succeeded|Succeeded)$/.test(t.status || ''))
         ? '<a href="#" onclick="downloadTask(\'' + t.task_id + '\');return false">下载</a>'
         : '';
       const cnLabel = statusToCN(t.status);
@@ -1192,7 +1220,10 @@ async function showTask(taskId) {
       const outputLabel = (usage.output_seconds != null) ? usage.output_seconds + 's' : '—';
       const durationLine = '⏱ 生成时长 ' + totalSec + 's（输入 ' + inputLabel + ' / 输出 ' + outputLabel + '）';
 
-      const price = (t.model && PRICING[t.model]) ? PRICING[t.model] : null;
+      // v0.2.8 — 按任务实际服务商取价。老记录没有 provider 字段时回退到
+      // 当前服务商；拓元内测价 0.05 元/s，与官方刊例价差异极大。
+      const taskProvider = t.extra && t.extra.provider ? t.extra.provider : activeProvider;
+      const price = pricingFor(taskProvider, t.model);
       const hasOutRate = price && t.resolution && price.out[t.resolution] != null;
 
       let costHtml;
@@ -1427,7 +1458,27 @@ function updateDurationSummary() {
 
 function applyModelConstraints() {
   if (!modelConstraints) return;
-  const model = $('model').value;
+
+  // v0.2.8 — 模型下拉跟随服务商重建：拓元只有 MiniMax-H3 且无 2K。
+  // 保留用户已选模型；若该模型在当前服务商下不存在，回退到第一个可用模型。
+  const modelSel = $('model');
+  const available = Object.keys(modelConstraints);
+  if (available.length) {
+    const wanted = modelSel.value;
+    const keep = available.indexOf(wanted) !== -1 ? wanted : available[0];
+    modelSel.innerHTML = '';
+    available.forEach(function(name) {
+      const c = modelConstraints[name];
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name + '（' + c.resolutions.join('/') + ' · ' +
+        c.duration_min + '-' + c.duration_max + 's）';
+      if (name === keep) opt.selected = true;
+      modelSel.appendChild(opt);
+    });
+  }
+
+  const model = modelSel.value;
   const c = modelConstraints[model];
   if (!c) return;
 
@@ -1475,6 +1526,22 @@ function applyModelConstraints() {
     if (!isH3Max) pe.value = '';
   }
 
+  // v0.2.8 — Context-IR 仅官方平台提供；拓元没有该接口，禁用并说明原因，
+  // 避免用户以为「勾了但没生效」。
+  const irBox = $('use-context-ir');
+  if (irBox) {
+    const supported = (activeProvider === 'minimax');
+    irBox.disabled = !supported;
+    if (!supported) irBox.checked = false;
+    const label = irBox.parentNode;
+    if (label) {
+      label.title = supported
+        ? ''
+        : '当前服务商（拓元）不提供 Context-IR，提示词将原样提交';
+      label.style.opacity = supported ? '' : '0.55';
+    }
+  }
+
   updateDurationSummary();
 }
 
@@ -1488,7 +1555,11 @@ async function loadConfigStatus() {
     const cfg = await res.json();
     // v0.2.2+: surface server version in the page footer
     if (cfg.version) $('footer-ver').textContent = 'v' + cfg.version;
-    // Build modelConstraints map
+    // v0.2.8 — provider state (server is authoritative: user file > env > default)
+    activeProvider = cfg.provider || 'minimax';
+    providerCatalog = {};
+    (cfg.providers || []).forEach(function(p) { providerCatalog[p.id] = p; });
+    // Build modelConstraints map (already provider-filtered by the backend)
     modelConstraints = {};
     cfg.models.forEach(function(m) {
       modelConstraints[m.name] = {
@@ -1499,6 +1570,18 @@ async function loadConfigStatus() {
         i2v_roles: m.i2v_roles || ['first_frame', 'last_frame'],
       };
     });
+    // Provider line under the model select
+    const pline = $('provider-line');
+    if (pline) {
+      const spec = providerCatalog[activeProvider];
+      pline.textContent = spec 
+        ? '当前服务商：' + spec.label
+        : '当前服务商：' + activeProvider;
+    }
+    // Key dialog: reflect the active provider
+    const psel = $('provider-select');
+    if (psel) psel.value = activeProvider;
+    updateProviderHint();
     // Update pill
     const pill = $('key-pill');
     const lbl = $('key-pill-label');
@@ -1512,7 +1595,7 @@ async function loadConfigStatus() {
                     : cfg.source === 'env'   ? '（环境变量兜底 · MINIMAX_API_KEY）'
                     : '';
       lbl.textContent = 'API Key: ' + cfg.masked + ' ' + srcLabel;
-      pill.title = '来源: ' + cfg.source;
+      pill.title = '来源: ' + cfg.source + ' · 服务商: ' + activeProvider;
     } else {
       pill.classList.remove('ok');
       pill.classList.add('missing');
@@ -1526,11 +1609,31 @@ async function loadConfigStatus() {
   } catch(e) { /* ignore */ }
 }
 
+// v0.2.8 — Key 对话框里的服务商提示文案。
+function updateProviderHint() {
+  const hint = $('provider-hint');
+  const psel = $('provider-select');
+  if (!hint || !psel) return;
+  const spec = providerCatalog[psel.value];
+  if (!spec) { hint.textContent = ''; return; }
+  const bits = [spec.label];
+  bits.push('模型：' + (spec.models || []).join(' / '));
+  bits.push(spec.supports_context_ir ? '支持 Context-IR' : '无 Context-IR');
+  hint.textContent = bits.join(' · ');
+}
+
 function openKeyDialog() {
   $('key-input').value = '';
   $('key-msg').textContent = '';
   $('key-msg').className = '';
-  $('key-status-line').textContent = '请输入你的 MiniMax API Key';
+  // Pre-select the provider actually in use
+  const psel = $('provider-select');
+  if (psel) psel.value = activeProvider;
+  updateProviderHint();
+  const spec = providerCatalog[activeProvider];
+  $('key-status-line').textContent = spec
+    ? '当前服务商：' + spec.label + ' · 请输入对应的 API Key'
+    : '请输入你的 MiniMax API Key';
   $('key-dialog').showModal();
   setTimeout(function() { $('key-input').focus(); }, 50);
 }
@@ -1546,10 +1649,11 @@ async function saveKey() {
   btn.disabled = true;
   btn.textContent = '保存中…';
   try {
+    const provider = $('provider-select') ? $('provider-select').value : null;
     const res = await fetch(BASE + '/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: key }),
+      body: JSON.stringify({ api_key: key, provider: provider }),
     });
     const data = await res.json();
     if (!res.ok) { setKeyMsg('保存失败: ' + (data.detail || res.status), true); return; }
@@ -1573,6 +1677,11 @@ function setKeyMsg(text, isErr) {
 
 // Wire model select
 $('model').addEventListener('change', applyModelConstraints);
+
+// v0.2.8 — provider select in the key dialog: refresh the capability hint.
+// (The switch only takes effect on save, so the form below is untouched here.)
+const providerSel = $('provider-select');
+if (providerSel) providerSel.addEventListener('change', updateProviderHint);
 
 // Wire duration input — recompute duration summary on every keystroke.
 $('duration').addEventListener('input', updateDurationSummary);

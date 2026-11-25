@@ -18,12 +18,15 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .config import (
-    API_MODELS,
-    MODEL_CONSTRAINTS,
+    PROVIDERS,
     Config,
     _user_config_path,
     load_config,
     mask_key,
+    normalize_provider,
+    provider_constraints,
+    provider_models,
+    provider_spec,
     require_api_key,
     save_config,
     user_data_path,
@@ -39,7 +42,7 @@ from .media import (
     ffprobe_duration,
     resolve_reference,
 )
-from .poller import TERMINAL_STATES, poll_until_done
+from .poller import TERMINAL_STATES, is_success, poll_until_done
 from .storage import (
     TaskRecord,
     delete_task,
@@ -143,8 +146,8 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         except ConfigError as e:
             raise HTTPException(status_code=503, detail=str(e))
 
-        # Validate mode constraints
-        _validate_mode(body)
+        # Validate mode constraints (provider-aware: Vectron has no H3-Max/2K)
+        _validate_mode(body, cfg.provider_key())
 
         # Defer insert_task until AFTER we have the real task_id, so we don't
         # leave a zombie "pending" row in the ledger on any failure path.
@@ -167,6 +170,11 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                     "resolution": body.resolution,
                     "duration": body.duration,
                     "ratio": effective_ratio,
+                    # v0.2.8 — which vendor produced this task. The UI prices a
+                    # record with the table of the provider that billed it
+                    # (Vectron's beta rate is ~1/10 of the official one), so a
+                    # later provider switch must not rewrite history.
+                    "provider": cfg.provider_key(),
                 }
                 if used_context_ir:
                     extra["used_context_ir"] = True
@@ -303,7 +311,7 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
                 require_api_key(cfg)
                 async with MiniMaxClient(cfg) as client:
                     api_task = await client.query_video_task(task_id)
-                    if api_task.get("status") not in ("Success", "Succeeded", "succeeded"):
+                    if not is_success(api_task.get("status", "")):
                         raise HTTPException(
                             status_code=409,
                             detail=f"任务状态 {api_task.get('status')}，视频尚未生成完成，请稍后再试",
@@ -343,43 +351,71 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         Once the user saves a key via POST /api/config, the next GET here
         reports ``has_key=True, source="user"`` and stays that way across
         process restarts.
+
+        v0.2.8+: also reports the selected ``provider`` and the model list /
+        capability set for **that** provider, so the UI can rebuild its model
+        dropdown and hide features the vendor does not offer (Vectron: no
+        H3-Max, no 2K, no Context-IR).
         """
         # Read the user config file directly — do NOT trust app.state.cfg
         # because at startup it may already carry an env/local key in memory
         # (which the UI should not surface).
         user_path = _user_config_path()
         user_key: Optional[str] = None
+        user_provider: Optional[str] = None
         if user_path.is_file():
             try:
                 data = json.loads(user_path.read_text(encoding="utf-8"))
                 user_key = (data.get("api_key") or "").strip() or None
+                user_provider = (data.get("provider") or "").strip() or None
             except (OSError, ValueError):
                 user_key = None
+                user_provider = None
+
+        # Provider: the user file wins (same authority as the key); otherwise
+        # fall back to whatever the live config resolved (env / default).
+        cfg = app.state.cfg
+        provider = normalize_provider(user_provider or cfg.provider_key())
+        models = provider_models(provider)
 
         return {
             "has_key": bool(user_key),
             "masked": mask_key(user_key),
             "source": "user" if user_key else "none",
             "user_config_path": str(user_path),
+            "provider": provider,
+            "provider_label": PROVIDERS[provider]["label"],
+            "providers": [
+                {
+                    "id": pid,
+                    "label": spec["label"],
+                    "models": spec["models"],
+                    "supports_context_ir": spec["supports_context_ir"],
+                    "supports_image_generation": spec["supports_image_generation"],
+                    "supports_prompt_expansion": spec["supports_prompt_expansion"],
+                }
+                for pid, spec in PROVIDERS.items()
+            ],
+            "supports_context_ir": bool(PROVIDERS[provider]["supports_context_ir"]),
             "models": [
                 {
                     "name": name,
-                    "resolutions": MODEL_CONSTRAINTS[name]["resolutions"],
-                    "duration_min": MODEL_CONSTRAINTS[name]["duration_min"],
-                    "duration_max": MODEL_CONSTRAINTS[name]["duration_max"],
-                    "modes": MODEL_CONSTRAINTS[name]["modes"],
-                    "i2v_roles": MODEL_CONSTRAINTS[name]["i2v_roles"],
+                    "resolutions": provider_constraints(provider, name)["resolutions"],
+                    "duration_min": provider_constraints(provider, name)["duration_min"],
+                    "duration_max": provider_constraints(provider, name)["duration_max"],
+                    "modes": provider_constraints(provider, name)["modes"],
+                    "i2v_roles": provider_constraints(provider, name)["i2v_roles"],
                 }
-                for name in API_MODELS
+                for name in models
             ],
-            "model_default": "MiniMax-H3",
+            "model_default": models[0] if models else "MiniMax-H3",
             "version": __version__,
         }
 
     # -------------------------------------------------------- POST /api/config
     @app.post("/api/config")
     def api_set_config(payload: Annotated[ConfigBody, Body()]) -> dict[str, Any]:
-        """Persist a new API key to the user config dir and update cfg in place.
+        """Persist a new API key (and optionally a provider) to the user config.
 
         The user config file is the **single source of truth for the API key**
         (v0.2.0+). This handler writes it there and updates the in-memory
@@ -388,12 +424,31 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
         here is immediately visible to the CLI without any restart — because
         user > local > env precedence, the saved key wins even when the env
         var is set (env is only a fallback for files without a key).
+
+        v0.2.8+: ``provider`` (optional) is saved to the same file. Switching
+        provider clears any explicit ``base_url`` override so the new
+        provider's endpoint takes effect — otherwise a previously saved
+        official base_url would keep pinning the old host.
         """
         cfg = app.state.cfg
         new_key = payload.api_key.strip()
         if not new_key:
             raise HTTPException(status_code=400, detail="api_key must not be empty")
         cfg.api_key = new_key
+
+        provider_changed = False
+        if payload.provider is not None:
+            try:
+                new_provider = normalize_provider(payload.provider)
+            except ConfigError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            provider_changed = new_provider != cfg.provider_key()
+            cfg.provider = new_provider
+            if provider_changed:
+                # Drop a stale endpoint override so the provider's own base
+                # URL applies (effective_base_url treats the default as "unset").
+                cfg.base_url = cfg.effective_base_url()
+
         try:
             saved_to = save_config(cfg, scope="user")
         except OSError as e:
@@ -406,6 +461,8 @@ def create_app(cfg: Optional[Config] = None) -> FastAPI:
             "masked": mask_key(cfg.api_key),
             "saved_to": str(saved_to),
             "source": "user",
+            "provider": cfg.provider_key(),
+            "provider_changed": provider_changed,
         }
 
     # -------------------------------------------------------- GET /api/probe/video (v0.1.5)
@@ -573,9 +630,15 @@ class CreateBody(BaseModel):
 
 class ConfigBody(BaseModel):
     api_key: Annotated[str, Field(min_length=1, max_length=512)]
+    # v0.2.8+: optional provider switch saved alongside the key. Omitted by
+    # older clients → the saved provider is left untouched.
+    provider: Annotated[
+        str | None,
+        Field(default=None, pattern=r"^(minimax|vectron)$"),
+    ] = None
 
 
-def _validate_mode(body: CreateBody) -> None:
+def _validate_mode(body: CreateBody, provider: Optional[str] = None) -> None:
     """校验 CreateBody 对齐 MiniMax V2 API schema。
 
     对齐要点（v0.1.6+）：
@@ -584,6 +647,8 @@ def _validate_mode(body: CreateBody) -> None:
       - text ≤7000 字符、ref_images ≤9、first_frame ≤1、last_frame ≤1；
       - 角色是否被模型支持由 validate_model_modes 校验（H3/H3-Max
         已统一收紧为首/尾帧，middle_frame 一律拒绝）。
+
+    v0.2.8+: ``provider`` 决定模型可用性与分辨率阶梯（拓元无 H3-Max、无 2K）。
     """
     mode = body.mode
     ratio = body.ratio
@@ -660,7 +725,7 @@ def _validate_mode(body: CreateBody) -> None:
         if n_imgs == 1:
             i2v_role = body.ref_images[0].get("role") or "first_frame"
             try:
-                validate_model_modes(body.model, mode="i2v", i2v_role=i2v_role)
+                validate_model_modes(body.model, mode="i2v", i2v_role=i2v_role, provider=provider)
             except ConfigError as e:
                 raise HTTPException(status_code=400, detail=str(e))
         else:  # n_imgs == 2
@@ -676,7 +741,8 @@ def _validate_mode(body: CreateBody) -> None:
             for r in body.ref_images:
                 try:
                     validate_model_modes(
-                        body.model, mode="i2v", i2v_role=r.get("role")
+                        body.model, mode="i2v", i2v_role=r.get("role"),
+                        provider=provider,
                     )
                 except ConfigError as e:
                     raise HTTPException(status_code=400, detail=str(e))
@@ -695,7 +761,7 @@ def _validate_mode(body: CreateBody) -> None:
             )
         # 多模态参考能力由模型决定：H3 与 H3-Max 均支持 r2v（参考图/参考视频/参考音频）。
         try:
-            validate_model_modes(body.model, mode="r2v")
+            validate_model_modes(body.model, mode="r2v", provider=provider)
         except ConfigError as e:
             raise HTTPException(status_code=400, detail=str(e))
         # r2v 的图角色只能是 reference_image；first/last_frame 已在全局互斥里拦掉。
@@ -727,18 +793,28 @@ def _validate_mode(body: CreateBody) -> None:
     # HTTPException(400) with a user-friendly message.
     try:
         validate_model_params(
-            body.model, resolution=body.resolution, duration=body.duration
+            body.model, resolution=body.resolution, duration=body.duration,
+            provider=provider,
         )
     except ConfigError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     # V2 extra.prompt_expansion_mode is only supported by MiniMax-H3-Max.
     # Reject early with 400 (rather than letting the API reject with 2013).
-    if body.prompt_expansion_mode is not None and body.model != "MiniMax-H3-Max":
-        raise HTTPException(
-            status_code=400,
-            detail="prompt_expansion_mode 仅 MiniMax-H3-Max 支持",
-        )
+    # The provider capability is checked in the same breath: no provider
+    # other than the official platform serves H3-Max at all, so a provider
+    # that lacks the switch must not silently accept the field either.
+    if body.prompt_expansion_mode is not None:
+        if body.model != "MiniMax-H3-Max":
+            raise HTTPException(
+                status_code=400,
+                detail="prompt_expansion_mode 仅 MiniMax-H3-Max 支持",
+            )
+        if not provider_spec(provider)["supports_prompt_expansion"]:
+            raise HTTPException(
+                status_code=400,
+                detail="当前服务商不支持 prompt_expansion_mode",
+            )
 
 
 async def _refresh_task_from_api(cfg: Config, rec: TaskRecord) -> dict[str, Any]:
@@ -828,7 +904,9 @@ async def _submit_task(client: MiniMaxClient, body: CreateBody) -> tuple[str, li
     )
 
     used_context_ir = False
-    if body.use_context_ir and body.model == "MiniMax-H3":
+    # Context-IR is official-platform only; cfg.supports_context_ir makes the
+    # Vectron path skip it outright (no wasted round trip, no error log).
+    if body.use_context_ir and body.model == "MiniMax-H3" and client.cfg.supports_context_ir:
         # i2v forces ratio=adaptive; the same applies to Context-IR, which
         # is just another H3 video path with no resolution requirement.
         ir_ratio = "adaptive" if body.mode == "i2v" else (body.ratio or "adaptive")

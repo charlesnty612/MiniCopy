@@ -79,7 +79,11 @@ class _FakeMiniMaxClient:
     return values / side effects. Exposes `await_fake` for assertions.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: Any = None) -> None:
+        # Mirror the real client's ``cfg`` attribute — web._submit_task reads
+        # capability flags (supports_context_ir) off it.
+        from minipic.config import Config as _Config
+        self.cfg = cfg if cfg is not None else _Config(api_key="k")
         self.create_video_task = AsyncMock(return_value="tid-default")
         self.query_video_task = AsyncMock(
             return_value={"status": "Success", "content": [{"url": "https://cdn/v.mp4"}]}
@@ -114,8 +118,12 @@ def fake_client_factory(monkeypatch: pytest.MonkeyPatch):
     """
     def _make() -> _FakeMiniMaxClient:
         fake = _FakeMiniMaxClient()
-        # Patch the symbol that web.py imported
-        monkeypatch.setattr("minipic.web.MiniMaxClient", lambda cfg: fake)
+        # Patch the symbol that web.py imported. Keep ``fake.cfg`` in sync with
+        # the config the handler actually uses, so capability checks see it.
+        monkeypatch.setattr(
+            "minipic.web.MiniMaxClient",
+            lambda cfg: setattr(fake, "cfg", cfg) or fake,
+        )
         return fake
 
     return _make
@@ -1737,7 +1745,9 @@ class TestApiConfigEndpoints:
         from minipic import web as web_mod
         class _Noop:
             def __init__(self, c: Config) -> None:
+                # web._submit_task reads capability flags off client.cfg
                 self.c = c
+                self.cfg = c
             async def __aenter__(self): return self
             async def __aexit__(self, *a): return None
             async def create_video_task(self, **kw): return "tid-after-rotate"

@@ -11,7 +11,7 @@ from .errors import TaskError
 
 log = logging.getLogger(__name__)
 
-# Status values from the MiniMax public API
+# Status values from the MiniMax public API (title-case, official platform).
 STATUS_PENDING = "Pending"
 STATUS_QUEUED = "Queuing"
 STATUS_RUNNING = "Processing"
@@ -19,7 +19,28 @@ STATUS_SUCCEEDED = "Success"
 STATUS_FAILED = "Failed"
 STATUS_CANCELLED = "Cancelled"
 STATUS_EXPIRED = "Expired"
-TERMINAL_STATES = {STATUS_SUCCEEDED, STATUS_FAILED, STATUS_CANCELLED, STATUS_EXPIRED}
+
+# Vectron serves the same V2 protocol but reports lowercase statuses
+# (queued / running / succeeded / failed / cancelled). Both spellings are
+# accepted everywhere so one code path covers either provider.
+SUCCESS_STATUSES = frozenset({"Success", "Succeeded", "succeeded", "SUCCEEDED"})
+FAILED_STATUSES = frozenset({"Failed", "failed", "FAILED"})
+CANCELLED_STATUSES = frozenset({"Cancelled", "Canceled", "cancelled", "canceled"})
+EXPIRED_STATUSES = frozenset({"Expired", "expired"})
+
+TERMINAL_STATES = (
+    SUCCESS_STATUSES | FAILED_STATUSES | CANCELLED_STATUSES | EXPIRED_STATUSES
+)
+
+
+def is_success(status: str) -> bool:
+    """True for any provider's success spelling."""
+    return status in SUCCESS_STATUSES
+
+
+def is_failure(status: str) -> bool:
+    """True for any provider's terminal-failure spelling."""
+    return status in (FAILED_STATUSES | CANCELLED_STATUSES | EXPIRED_STATUSES)
 
 ProgressCb = Callable[[str], Awaitable[None] | None]
 
@@ -49,9 +70,9 @@ async def poll_until_done(
                     await ret
             last_status = status
 
-        if status == STATUS_SUCCEEDED:
+        if is_success(status):
             return task
-        if status in (STATUS_FAILED, STATUS_CANCELLED, STATUS_EXPIRED):
+        if is_failure(status):
             err = task.get("error") or task.get("base_resp") or task
             raise TaskError(f"task {task_id} ended in {status}: {err}")
 

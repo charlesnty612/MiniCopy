@@ -10,6 +10,12 @@ Why both V1 and V2: H3 V2 content[] references uploaded files via the
 needed. We upload with the V1 file API and reference the returned file_id
 directly.
 
+Providers (v0.2.8+): the same V2 protocol is served by more than one vendor.
+``cfg.provider`` selects the base URL, the upload path, and the wire model id;
+see ``config.PROVIDERS``. Capability differences (Vectron has no H3-Max, no 2K,
+no Context-IR, no image-01) are enforced before the request is built so the
+caller gets a clear error instead of a vendor-side 4xx.
+
 Authentication: Bearer <api_key>.
 Retry policy: 1000 / 1001 / 1002 with bounded backoff. Other codes raise immediately.
 """
@@ -25,18 +31,20 @@ from typing import Any, Optional
 
 import httpx
 
-from .config import Config
+from .config import Config, provider_constraints, resolve_model_id
 from .errors import (
     ApiErrorPayload,
     ConfigError,
     RETRYABLE_CODES,
+    RETRYABLE_HTTP_STATUS,
     ServerError,
     raise_for_code,
 )
 
 log = logging.getLogger(__name__)
 
-# Endpoints (relative to base_url)
+# Endpoints (relative to base_url). Upload is provider-specific — read it from
+# ``cfg.upload_path`` rather than these constants.
 EP_UPLOAD = "/v1/files/upload"
 EP_CREATE_VIDEO = "/v2/video_generation"
 EP_QUERY_VIDEO = "/v2/query/video_generation/{task_id}"
@@ -58,7 +66,11 @@ class MiniMaxClient:
 
     @property
     def base_url(self) -> str:
-        return self.cfg.base_url.rstrip("/")
+        return self.cfg.effective_base_url()
+
+    @property
+    def provider(self) -> str:
+        return self.cfg.provider_key()
 
     async def __aenter__(self) -> "MiniMaxClient":
         self._client = httpx.AsyncClient(
@@ -83,7 +95,13 @@ class MiniMaxClient:
     # ---------------------------------------------------------------- upload
 
     async def upload_file(self, path: Path, purpose: str = "video_generation_input") -> str:
-        """Upload a local file to V1 file management. Returns the file_id."""
+        """Upload a local file to the provider's file API. Returns the file_id.
+
+        Response shapes differ between providers, so the id is extracted
+        tolerantly:
+          - official: ``{"file": {"file_id": "..."}}`` or ``{"file_id": "..."}``
+          - Vectron:  ``{"id": "...", "filename": ..., "purpose": ...}``
+        """
         if not path.is_file():
             raise ConfigError(f"file not found: {path}")
 
@@ -93,16 +111,12 @@ class MiniMaxClient:
             data = {"purpose": purpose}
             try:
                 resp = await self._request_with_retry(
-                    "POST", EP_UPLOAD, data=data, files=files
+                    "POST", self.cfg.upload_path, data=data, files=files
                 )
             except httpx.HTTPError as e:
                 raise ConfigError(f"upload failed: {e}") from e
         body = resp.json()
-        # V1 response shape: {"file": {"file_id": "...", ...}} or {"file_id": "..."}
-        file_id = (
-            (body.get("file") or {}).get("file_id")
-            or body.get("file_id")
-        )
+        file_id = _extract_file_id(body)
         if not file_id:
             raise ConfigError(f"upload response missing file_id: {body}")
         log.debug("uploaded %s as %s", path.name, file_id)
@@ -145,14 +159,19 @@ class MiniMaxClient:
         Passing ``None`` (default) means "do not send the field". Per the
         official docs the API rejects empty strings / booleans / undeclared
         fields, so we omit entirely instead of sending nulls.
+
+        ``model`` is a **canonical** name (``MiniMax-H3`` / ``MiniMax-H3-Max``);
+        it is translated to the provider's wire id here (Vectron:
+        ``MiniMax/MiniMax-H3``). A model the provider does not serve raises
+        ConfigError before any request is made.
         """
-        if model not in ("MiniMax-H3", "MiniMax-H3-Max"):
-            raise ConfigError(
-                f"unsupported model: {model!r} (supported: MiniMax-H3, MiniMax-H3-Max)"
-            )
+        # Raises ConfigError when this provider does not serve ``model`` —
+        # the canonical-name guard for every caller (web, CLI, future surfaces).
+        provider_constraints(self.provider, model)
+        wire_model = resolve_model_id(self.provider, model)
 
         payload: dict[str, Any] = {
-            "model": model,
+            "model": wire_model,
             "content": content,
             "duration": duration,
             "resolution": resolution,
@@ -169,6 +188,10 @@ class MiniMaxClient:
                 raise ConfigError(
                     f"prompt_expansion_mode is only supported by MiniMax-H3-Max "
                     f"(got model={model!r})"
+                )
+            if not self.cfg.provider_spec()["supports_prompt_expansion"]:
+                raise ConfigError(
+                    f"provider {self.provider!r} does not support prompt_expansion_mode"
                 )
             if prompt_expansion_mode not in {"disabled", "balanced", "quality"}:
                 raise ConfigError(
@@ -202,7 +225,14 @@ class MiniMaxClient:
 
         Returns a list of image URLs (``response_format="url"``) or base64
         strings (``response_format="base64"``). URLs expire after 24 hours.
+
+        Only the official platform serves image-01; providers without it raise
+        ConfigError instead of a vendor-side 404.
         """
+        if not self.cfg.supports_image_generation:
+            raise ConfigError(
+                f"provider {self.provider!r} does not provide image generation"
+            )
         payload: dict[str, Any] = {
             "model": "image-01",
             "prompt": prompt,
@@ -269,13 +299,20 @@ class MiniMaxClient:
         brief + optional reference media, it returns a structured H3 6-section
         prompt. Use the returned content.prompt as the text element for a
         follow-up H3 generation call.
+
+        The endpoint is official-platform only; providers without it raise
+        ConfigError so callers can fall back to the original prompt.
         """
+        if not self.cfg.supports_context_ir:
+            raise ConfigError(
+                f"provider {self.provider!r} does not provide H3-Context-IR"
+            )
         if model != "MiniMax-H3":
             raise ConfigError(
                 f"unsupported model: {model!r} (H3-Context-IR only supports MiniMax-H3)"
             )
         payload: dict[str, Any] = {
-            "model": model,
+            "model": resolve_model_id(self.provider, model),
             "content": content,
             "duration": duration,
             "ratio": ratio,
@@ -347,7 +384,7 @@ class MiniMaxClient:
                 await asyncio.sleep(_backoff(attempt))
                 continue
 
-            if resp.status_code == 200:
+            if 200 <= resp.status_code < 300:
                 return resp
 
             # Parse error body
@@ -355,11 +392,17 @@ class MiniMaxClient:
                 err_body = resp.json()
             except Exception:  # noqa: BLE001
                 err_body = {"message": resp.text[:500]}
+            if not isinstance(err_body, dict):
+                err_body = {"message": resp.text[:500]}
 
-            code = err_body.get("code") or err_body.get("error", {}).get("code") or 0
+            err_obj = err_body.get("error")
+            if not isinstance(err_obj, dict):
+                err_obj = {}
+            code = err_body.get("code") or err_obj.get("code") or 0
             msg = (
-                err_body.get("message")
-                or err_body.get("error", {}).get("message")
+                err_obj.get("message")
+                or err_body.get("message")
+                or err_obj.get("msg")
                 or resp.text[:200]
             )
             request_id = err_body.get("request_id") or err_body.get("id")
@@ -375,7 +418,12 @@ class MiniMaxClient:
                 if m:
                     code = int(m.group(1))
 
-            if code in RETRYABLE_CODES and attempt < max_attempts:
+            # Providers that report errors by bare HTTP status (Vectron) never
+            # populate ``code``; treat their retryable statuses the same way.
+            retryable = code in RETRYABLE_CODES or (
+                not code and resp.status_code in RETRYABLE_HTTP_STATUS
+            )
+            if retryable and attempt < max_attempts:
                 ra = resp.headers.get("Retry-After")
                 if ra:
                     try:
@@ -398,6 +446,24 @@ class MiniMaxClient:
             )
 
         raise ServerError("unreachable: retries exhausted")
+
+
+def _extract_file_id(body: dict[str, Any]) -> Optional[str]:
+    """Pull the uploaded file id out of either provider's upload response.
+
+    Shapes observed:
+      - official: ``{"file": {"file_id": "..."}}`` (nested file object)
+      - official: ``{"file_id": "..."}`` (flat, older/variant responses)
+      - Vectron:  ``{"id": "...", "filename": ..., "purpose": ...}``
+    """
+    file_obj = body.get("file")
+    if isinstance(file_obj, dict) and file_obj.get("file_id"):
+        return str(file_obj["file_id"])
+    for key in ("file_id", "id"):
+        value = body.get(key)
+        if value:
+            return str(value)
+    return None
 
 
 def _backoff(attempt: int) -> float:
